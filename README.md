@@ -79,9 +79,27 @@ and 100 GiB total; resume after daemon restart is not yet supported.
 
 Copying files normally in Finder or Thunar opens a two-button confirmation window. **Normal copy
 only** is selected by default and sends nothing. Use Up/Down or Tab to select, then Enter to
-confirm; mouse clicks also work. **Share with lan-cat** continues to peer selection and the
-dedicated transfer. This also works with Command/Ctrl+C; lan-cat detects a file clipboard change,
-not the specific menu action. Text and image clipboard sync is unchanged.
+confirm; mouse clicks also work. **Sync clipboard** sends the file clipboard payload through normal
+clipboard synchronization so it can be pasted on another device. This path retains the clipboard
+limit of 64 files and 16 MiB total. This also works with Command/Ctrl+C; lan-cat detects a file
+clipboard change, not the specific menu action. The separate **Share with lan-cat** action uses the
+large-file transfer protocol.
+
+The confirmation uses the Wayland app ID `lan-cat-copy-prompt`, has no window decorations, and
+requests always-on-top. Wayland compositors control whether a window floats, so add the matching
+rule for your compositor:
+
+```text
+# Sway
+for_window [app_id="lan-cat-copy-prompt"] floating enable, move position center
+
+# Hyprland 0.55+ (Lua config)
+hl.window_rule({
+  match = { class = "lan-cat-copy-prompt" },
+  float = true,
+  center = true,
+})
+```
 
 Install desktop file-manager actions after placing the final binary at its permanent path:
 

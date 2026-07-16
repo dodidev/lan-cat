@@ -17,7 +17,10 @@ pub fn share(paths: Vec<PathBuf>, preferred_peer: Option<String>) -> Result<()> 
 }
 
 pub fn copy_prompt(paths: Vec<PathBuf>) -> Result<()> {
-    open_sender(paths, None, true)
+    run_copy_prompt(
+        "Files copied",
+        TransferApp::sender(paths, Vec::new(), None, true),
+    )
 }
 
 fn open_sender(
@@ -66,6 +69,25 @@ fn run(title: &str, app: TransferApp) -> Result<()> {
             .with_min_inner_size([420.0, 280.0]),
         ..Default::default()
     };
+    run_native(title, options, app)
+}
+
+fn run_copy_prompt(title: &str, app: TransferApp) -> Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id("lan-cat-copy-prompt")
+            .with_inner_size([420.0, 260.0])
+            .with_min_inner_size([420.0, 260.0])
+            .with_max_inner_size([420.0, 260.0])
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_always_on_top(),
+        ..Default::default()
+    };
+    run_native(title, options, app)
+}
+
+fn run_native(title: &str, options: eframe::NativeOptions, app: TransferApp) -> Result<()> {
     eframe::run_native(title, options, Box::new(move |_| Ok(Box::new(app))))
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
@@ -188,6 +210,11 @@ impl TransferApp {
             let move_down = ui.input(|input| input.key_pressed(egui::Key::ArrowDown));
             let tab = ui.input(|input| input.key_pressed(egui::Key::Tab));
             let confirm = ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+            if escape {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
             if move_up {
                 *copy_choice = copy_choice.saturating_sub(1);
             }
@@ -209,19 +236,24 @@ impl TransferApp {
                         .selected(*copy_choice == 0),
                 );
                 ui.add_space(10.0);
-                let share = ui.add_sized(
+                let sync = ui.add_sized(
                     size,
-                    egui::Button::new(egui::RichText::new("Share with lan-cat").size(20.0))
+                    egui::Button::new(egui::RichText::new("Sync clipboard").size(20.0))
                         .selected(*copy_choice == 1),
                 );
                 ui.add_space(14.0);
-                ui.label("↑/↓ select  ·  Enter confirm");
+                ui.label("↑/↓ select  ·  Enter confirm  ·  Esc normal copy");
 
                 if normal.clicked() || (confirm && *copy_choice == 0) {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if share.clicked() || (confirm && *copy_choice == 1) {
-                    *copied_prompt = false;
+                if sync.clicked() || (confirm && *copy_choice == 1) {
+                    match ipc::call_blocking(&Request::ClipboardSyncFiles {
+                        paths: paths.clone(),
+                    }) {
+                        Ok(_) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(error) => self.error = Some(error.to_string()),
+                    }
                 }
             });
             return;

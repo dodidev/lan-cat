@@ -21,6 +21,9 @@ pub enum Request {
     Status,
     Pause,
     Resume,
+    ClipboardSyncFiles {
+        paths: Vec<PathBuf>,
+    },
     Unpair {
         peer: String,
     },

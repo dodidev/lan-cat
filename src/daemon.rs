@@ -44,9 +44,11 @@ struct NetworkContext {
 enum Control {
     Pause,
     Resume,
+    SyncPayload(crate::protocol::ClipboardPayload),
 }
 
 pub async fn run() -> Result<()> {
+    configure_copy_prompt_window();
     let cfg = Config::load_or_create()?;
     let id = network::device_id(&cfg.public_key()?);
     let mut clipboard = Clipboard::start()?;
@@ -117,17 +119,17 @@ pub async fn run() -> Result<()> {
                     }
                     continue;
                 };
-                let sequence = clock.increment(&id);
-                {
-                    let mut value = cfg.write().await;
-                    value.clock = clock.clone();
-                    value.save()?;
-                }
-                let event = ClipboardEvent::new(id.clone(), sequence, clock.clone(), payload)?;
-                remember(event.id, &mut seen, &mut seen_order);
-                current = Some(event.clone());
-                *latest.write().await = Some(event.clone());
-                let _ = bus_tx.send(BusEvent { source: None, target: None, message: Message::Clipboard(event) });
+                publish_local_payload(
+                    payload,
+                    &id,
+                    &mut clock,
+                    &cfg,
+                    &mut seen,
+                    &mut seen_order,
+                    &mut current,
+                    &latest,
+                    &bus_tx,
+                ).await?;
             }
             incoming = incoming_rx.recv() => {
                 let Some(Incoming { peer, message }) = incoming else { bail!("network manager stopped"); };
@@ -174,6 +176,19 @@ pub async fn run() -> Result<()> {
                     current = None;
                     *latest.write().await = None;
                 }
+                Some(Control::SyncPayload(payload)) => {
+                    publish_local_payload(
+                        payload,
+                        &id,
+                        &mut clock,
+                        &cfg,
+                        &mut seen,
+                        &mut seen_order,
+                        &mut current,
+                        &latest,
+                        &bus_tx,
+                    ).await?;
+                }
                 None => bail!("IPC control channel stopped"),
             },
             outbound = transfer_rx.recv() => {
@@ -189,6 +204,59 @@ pub async fn run() -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configure_copy_prompt_window() {
+    if std::env::var_os("SWAYSOCK").is_none() {
+        return;
+    }
+    let status = std::process::Command::new("swaymsg")
+        .args([
+            "for_window",
+            r#"[app_id="lan-cat-copy-prompt"]"#,
+            "floating enable, move position center",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !status.is_ok_and(|status| status.success()) {
+        tracing::warn!("could not register Sway floating rule for copy prompt");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_copy_prompt_window() {}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_local_payload(
+    payload: crate::protocol::ClipboardPayload,
+    id: &str,
+    clock: &mut crate::ordering::VersionVector,
+    cfg: &Arc<RwLock<Config>>,
+    seen: &mut HashSet<uuid::Uuid>,
+    seen_order: &mut VecDeque<uuid::Uuid>,
+    current: &mut Option<ClipboardEvent>,
+    latest: &Arc<RwLock<Option<ClipboardEvent>>>,
+    bus: &broadcast::Sender<BusEvent>,
+) -> Result<()> {
+    let sequence = clock.increment(id);
+    {
+        let mut value = cfg.write().await;
+        value.clock = clock.clone();
+        value.save()?;
+    }
+    let event = ClipboardEvent::new(id.to_owned(), sequence, clock.clone(), payload)?;
+    remember(event.id, seen, seen_order);
+    *current = Some(event.clone());
+    *latest.write().await = Some(event.clone());
+    let _ = bus.send(BusEvent {
+        source: None,
+        target: None,
+        message: Message::Clipboard(event),
+    });
     Ok(())
 }
 
@@ -460,6 +528,17 @@ async fn handle_ipc(
                     "Synchronization resumed from current clipboard baseline.".into(),
                     None,
                 ))
+            }
+            ipc::Request::ClipboardSyncFiles { paths } => {
+                if cfg.read().await.paused {
+                    bail!("clipboard synchronization is paused");
+                }
+                let payload = tokio::task::spawn_blocking(move || {
+                    crate::clipboard::payload_from_paths(paths)
+                })
+                .await??;
+                control.send(Control::SyncPayload(payload))?;
+                Ok(("Files queued for clipboard synchronization.".into(), None))
             }
             ipc::Request::Unpair { peer } => {
                 let mut value = cfg.write().await;

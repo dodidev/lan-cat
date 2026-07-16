@@ -37,6 +37,15 @@ pub struct Clipboard {
     pub backend: &'static str,
 }
 
+pub fn payload_from_paths(paths: Vec<PathBuf>) -> Result<ClipboardPayload> {
+    let payload = ClipboardPayload {
+        files: files::read_file_paths(paths)?,
+        ..Default::default()
+    };
+    payload.validate()?;
+    Ok(payload)
+}
+
 impl Clipboard {
     pub fn start() -> Result<Self> {
         let (change_tx, change_rx) = async_mpsc::unbounded_channel();
