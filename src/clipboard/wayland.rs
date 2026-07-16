@@ -4,7 +4,7 @@ use std::{
     process::{Command as ProcessCommand, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -21,6 +21,12 @@ use super::{
 use crate::protocol::{ClipboardFile, ClipboardPayload, MAX_PAYLOAD_BYTES};
 
 pub(super) const NAME: &str = "wayland-data-control";
+const FALLBACK_POLL: Duration = Duration::from_secs(2);
+
+enum WatchEvent {
+    Selection,
+    Stopped,
+}
 
 pub(super) fn spawn(
     changes: async_mpsc::UnboundedSender<Change>,
@@ -39,7 +45,7 @@ pub(super) fn spawn(
     let initial = initial_file_paths.is_none().then(read_payload).flatten();
     let initial_payload = initial.clone();
     let (watch_tx, watch_rx) = mpsc::channel();
-    spawn_selection_watcher(watch_tx);
+    let mut watcher_active = spawn_selection_watcher(watch_tx);
     thread::Builder::new()
         .name("lan-cat-wayland".into())
         .spawn(move || {
@@ -48,6 +54,7 @@ pub(super) fn spawn(
             let mut injected: Option<[u8; 32]> = None;
             let mut injected_files: Option<Vec<std::path::PathBuf>> = None;
             let mut handled_files: Option<Vec<std::path::PathBuf>> = None;
+            let mut fallback_poll_at = Instant::now();
             let mut retained = VecDeque::new();
             loop {
                 match commands.recv_timeout(Duration::from_millis(250)) {
@@ -79,8 +86,18 @@ pub(super) fn spawn(
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
                 let mut selection_changed = false;
-                while watch_rx.try_recv().is_ok() {
-                    selection_changed = true;
+                while let Ok(event) = watch_rx.try_recv() {
+                    match event {
+                        WatchEvent::Selection => selection_changed = true,
+                        WatchEvent::Stopped => watcher_active = false,
+                    }
+                }
+                let fallback_poll = !watcher_active && fallback_poll_at.elapsed() >= FALLBACK_POLL;
+                if fallback_poll {
+                    fallback_poll_at = Instant::now();
+                }
+                if !selection_changed && !fallback_poll {
+                    continue;
                 }
                 let Some(change) = read_change() else {
                     continue;
@@ -126,8 +143,8 @@ pub(super) fn spawn(
     Ok(initial)
 }
 
-fn spawn_selection_watcher(changes: mpsc::Sender<()>) {
-    thread::Builder::new()
+fn spawn_selection_watcher(changes: mpsc::Sender<WatchEvent>) -> bool {
+    let builder = thread::Builder::new()
         .name("lan-cat-wayland-watch".into())
         .spawn(move || {
             let mut child = match ProcessCommand::new("wl-paste")
@@ -140,21 +157,24 @@ fn spawn_selection_watcher(changes: mpsc::Sender<()>) {
                 Ok(child) => child,
                 Err(error) => {
                     tracing::debug!(%error, "wl-paste selection watcher unavailable");
+                    let _ = changes.send(WatchEvent::Stopped);
                     return;
                 }
             };
             let Some(mut stdout) = child.stdout.take() else {
+                let _ = changes.send(WatchEvent::Stopped);
                 return;
             };
             let mut byte = [0_u8; 1];
             while stdout.read(&mut byte).is_ok_and(|read| read > 0) {
-                if changes.send(()).is_err() {
+                if changes.send(WatchEvent::Selection).is_err() {
                     break;
                 }
             }
             let _ = child.kill();
-        })
-        .ok();
+            let _ = changes.send(WatchEvent::Stopped);
+        });
+    builder.is_ok()
 }
 
 fn current_file_paths() -> Option<Vec<std::path::PathBuf>> {
