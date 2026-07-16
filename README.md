@@ -1,6 +1,17 @@
 # lan-cat
 
-Secure, peer-to-peer clipboard sync for macOS and Linux Wayland desktops.
+Secure, peer-to-peer clipboard sync and LAN file sharing for macOS and Linux Wayland desktops.
+
+## Current feature set
+
+- Peer-to-peer clipboard sync for text, HTML, RTF, PNG, and copied regular files.
+- Explicit LAN file sharing with peer selection, accept/reject, destination selection, progress,
+  transfer speed, cancellation, and safe `.part` writes.
+- Local file-copy confirmation popup for Finder/Thunar copy operations: **Normal copy only** by
+  default, or **Sync clipboard** when the copied files should be sent through clipboard sync.
+- Finder Quick Action on macOS and Thunar custom action on Linux for **Share with lan-cat**.
+- Manual-start user service support through `launchctl` on macOS and `systemd --user` on Linux.
+- LAN-only discovery through mDNS, with encrypted authenticated connections between trusted peers.
 
 ## Security model
 
@@ -27,11 +38,35 @@ clipboard data from software already running as your local user.
 Linux integration uses Wayland protocols directly through `wl-clipboard-rs`; it prefers the modern
 `ext-data-control-v1` protocol and falls back to `wlr-data-control-v1`.
 
-## Build and setup
+## Install
 
 ```sh
 cargo build --release
 ```
+
+Recommended macOS install path:
+
+```sh
+sudo install -m 755 target/release/lan-cat /usr/local/bin/lan-cat
+```
+
+`/opt/homebrew/bin/lan-cat` is also fine on Apple Silicon if that is your normal user binary path.
+Use one stable path before installing services or Finder integration, because those files record the
+current executable path.
+
+Recommended Linux user install path:
+
+```sh
+install -Dm755 target/release/lan-cat ~/.local/bin/lan-cat
+```
+
+System-wide Linux install is also supported:
+
+```sh
+sudo install -m 755 target/release/lan-cat /usr/local/bin/lan-cat
+```
+
+## Pair and run
 
 Stop the daemon on both devices, then run this command concurrently on both:
 
@@ -64,6 +99,44 @@ lan-cat name set-name
 lan-cat share <file> [more-files...]
 lan-cat transfers
 lan-cat integration install
+lan-cat integration uninstall
+lan-cat service status
+lan-cat service stop
+lan-cat service uninstall
+```
+
+## Configuration and keys
+
+`lan-cat` stores identity keys and trusted peers in `config.json`.
+
+Default macOS path:
+
+```text
+~/Library/Application Support/org.lan-cat.lan-cat/config.json
+```
+
+Default Linux path:
+
+```text
+~/.config/lan-cat/config.json
+```
+
+The config contains the local X25519 private/public key pair, device name, pause state, version
+clock, and pinned peer public keys. Clipboard contents and transfer payloads are not stored there.
+On Unix, the config directory is set to `0700` and the config file is set to `0600`.
+
+Service files are installed to:
+
+```text
+macOS: ~/Library/Application Support/org.lan-cat.lan-cat/org.lan-cat.daemon.plist
+Linux: ~/.config/systemd/user/lan-cat.service
+```
+
+Integration files are installed to:
+
+```text
+macOS: ~/Library/Services/Share with lan-cat.workflow
+Linux: ~/.config/Thunar/uca.xml
 ```
 
 ## Explicit file sharing
@@ -77,13 +150,14 @@ before the next chunk is sent. The receiver writes hidden `.part` files and atom
 completed file. Existing destination files are never overwritten. Transfers support up to 256 files
 and 100 GiB total; resume after daemon restart is not yet supported.
 
-Copying files normally in Finder or Thunar opens a two-button confirmation window. **Normal copy
-only** is selected by default and sends nothing. Use Up/Down or Tab to select, then Enter to
-confirm; mouse clicks also work. **Sync clipboard** sends the file clipboard payload through normal
-clipboard synchronization so it can be pasted on another device. This path retains the clipboard
-limit of 64 files and 16 MiB total. This also works with Command/Ctrl+C; lan-cat detects a file
-clipboard change, not the specific menu action. The separate **Share with lan-cat** action uses the
-large-file transfer protocol.
+Copying files normally in Finder or Thunar opens a two-button confirmation window on the device
+where the copy happened. **Normal copy only** is selected by default and sends nothing. Use Up/Down
+or Tab to select, Enter to confirm, and Esc to close with the default normal-copy behavior. Mouse
+clicks also work. **Sync clipboard** sends the file clipboard payload through normal clipboard
+synchronization so it can be pasted on another device. This path retains the clipboard limit of 64
+files and 16 MiB total. The receiver should not open another confirmation popup for remote-injected
+file clipboard data. The separate **Share with lan-cat** action uses the large-file transfer
+protocol.
 
 The confirmation uses the Wayland app ID `lan-cat-copy-prompt`, has no window decorations, and
 requests always-on-top. Wayland compositors control whether a window floats, so add the matching
@@ -118,6 +192,8 @@ Remove them with `lan-cat integration uninstall`.
 - Up to 64 files can be copied together. Aggregate clipboard payload limit is 16 MiB.
 - File names and contents are preserved; permissions, timestamps, extended attributes, and resource
   forks are not.
+- Copied directories are rejected by clipboard sync. Use explicit file sharing after selecting
+  regular files.
 - Protocol v4 requires all syncing peers to run an upgraded daemon.
 - Existing clipboard content is captured at startup and replayed to peers during the same daemon run.
 - Latest in-memory event is sent when a peer reconnects during the same daemon run.
