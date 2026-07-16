@@ -3,7 +3,9 @@ use std::{sync::mpsc, thread, time::Duration};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc as async_mpsc;
 
-use crate::protocol::{MAX_TEXT_BYTES, validate_text};
+#[cfg(target_os = "linux")]
+use crate::protocol::MAX_TEXT_BYTES;
+use crate::protocol::validate_text;
 
 enum Command {
     Set(String),
@@ -136,8 +138,8 @@ mod platform {
             .name("lan-cat-pasteboard".into())
             .spawn(move || {
                 autoreleasepool(|_| {
-                    let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
-                    let mut count = unsafe { pasteboard.changeCount() };
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    let mut count = pasteboard.changeCount();
                     let mut injected_count = None;
                     loop {
                         match commands.recv_timeout(Duration::from_millis(250)) {
@@ -150,14 +152,14 @@ mod platform {
                                 count = pasteboard.changeCount();
                                 injected_count = Some(count);
                             },
-                            Ok(Command::Rebaseline) => unsafe {
+                            Ok(Command::Rebaseline) => {
                                 count = pasteboard.changeCount();
                                 injected_count = None;
-                            },
+                            }
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             Err(mpsc::RecvTimeoutError::Timeout) => {}
                         }
-                        let current = unsafe { pasteboard.changeCount() };
+                        let current = pasteboard.changeCount();
                         if current == count {
                             continue;
                         }
