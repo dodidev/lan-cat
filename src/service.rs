@@ -109,7 +109,11 @@ async fn start() -> Result<()> {
     let domain = format!("gui/{}", unsafe { libc::geteuid() });
     run_command_owned(
         "launchctl",
-        vec!["bootstrap".into(), domain, service_path()?.into_os_string()],
+        vec![
+            "bootstrap".into(),
+            domain.into(),
+            service_path()?.into_os_string(),
+        ],
     )
     .await
 }
