@@ -1,10 +1,10 @@
+use std::{collections::VecDeque, ffi::OsStr, fs, io::Read, path::PathBuf};
+
+#[cfg(any(target_os = "linux", test))]
 use std::{
-    collections::VecDeque,
-    ffi::{OsStr, OsString},
-    fs,
-    io::Read,
+    ffi::OsString,
     os::unix::ffi::{OsStrExt, OsStringExt},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use anyhow::{Context, Result};
@@ -20,6 +20,7 @@ pub(super) fn read_file_uris<'a>(
     read_file_paths(paths_from_file_uris(uris)?)
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn paths_from_file_uris<'a>(
     uris: impl IntoIterator<Item = &'a str>,
 ) -> Result<Vec<PathBuf>> {
@@ -61,6 +62,7 @@ pub(super) fn read_file_paths(paths: Vec<PathBuf>) -> Result<Vec<ClipboardFile>>
     Ok(files)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn path_from_file_uri(uri: &str) -> Result<PathBuf> {
     let value = uri
         .trim()
@@ -77,6 +79,7 @@ fn path_from_file_uri(uri: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_vec(bytes)))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn percent_decode(value: &[u8]) -> Result<Vec<u8>> {
     let mut decoded = Vec::with_capacity(value.len());
     let mut index = 0;
@@ -97,6 +100,7 @@ fn percent_decode(value: &[u8]) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn file_uri(path: &Path) -> String {
     let mut uri = String::from("file://");
     for byte in path.as_os_str().as_bytes() {

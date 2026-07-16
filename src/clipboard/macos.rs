@@ -1,17 +1,25 @@
-use std::{collections::VecDeque, sync::mpsc, thread, time::Duration};
+use std::{
+    collections::VecDeque,
+    ffi::{CStr, OsString},
+    os::unix::ffi::OsStringExt,
+    path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use objc2::{rc::autoreleasepool, runtime::ProtocolObject};
 use objc2_app_kit::{
-    NSPasteboard, NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypeHTML,
-    NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardWriting,
+    NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeHTML, NSPasteboardTypePNG,
+    NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardWriting,
 };
-use objc2_foundation::{NSArray, NSData, NSString};
+use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 use tokio::sync::mpsc as async_mpsc;
 
 use super::{
     Change, Command,
-    files::{file_uri, materialize_files, paths_from_file_uris, read_file_paths},
+    files::{materialize_files, read_file_paths},
 };
 use crate::protocol::{ClipboardFile, ClipboardPayload};
 
@@ -130,7 +138,7 @@ fn read_files(pasteboard: &NSPasteboard) -> Result<Option<Vec<ClipboardFile>>> {
     Ok(Some(read_file_paths(paths)?))
 }
 
-fn read_file_paths_from(pasteboard: &NSPasteboard) -> Result<Option<Vec<std::path::PathBuf>>> {
+fn read_file_paths_from(pasteboard: &NSPasteboard) -> Result<Option<Vec<PathBuf>>> {
     let Some(items) = pasteboard.pasteboardItems() else {
         return Ok(None);
     };
@@ -144,7 +152,24 @@ fn read_file_paths_from(pasteboard: &NSPasteboard) -> Result<Option<Vec<std::pat
     if uris.is_empty() {
         return Ok(None);
     }
-    Ok(Some(paths_from_file_uris(uris.iter().map(String::as_str))?))
+    Ok(Some(
+        uris.iter()
+            .map(|uri| macos_path_from_file_uri(uri))
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn macos_path_from_file_uri(uri: &str) -> Result<PathBuf> {
+    let url = NSURL::URLWithString(&NSString::from_str(uri)).context("invalid file URL")?;
+    if !url.isFileURL() {
+        anyhow::bail!("pasteboard URL is not a local file URL");
+    }
+    let url = url
+        .filePathURL()
+        .context("cannot resolve macOS file-reference URL")?;
+    // SAFETY: NSURL guarantees a NUL-terminated filesystem representation for a file URL.
+    let bytes = unsafe { CStr::from_ptr(url.fileSystemRepresentation().as_ptr()) }.to_bytes();
+    Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
 }
 
 fn write_payload(
@@ -156,14 +181,9 @@ fn write_payload(
         let paths = materialize_files(&payload.files, retained)?;
         let mut objects = Vec::with_capacity(paths.len());
         for path in paths {
-            let item = NSPasteboardItem::new();
-            let uri = NSString::from_str(&file_uri(&path));
-            // SAFETY: FileURL exists on every supported macOS version.
-            if !unsafe { item.setString_forType(&uri, NSPasteboardTypeFileURL) } {
-                anyhow::bail!("pasteboard rejected file URL data");
-            }
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
             objects.push(ProtocolObject::<dyn NSPasteboardWriting>::from_retained(
-                item,
+                url,
             ));
         }
         let objects = NSArray::from_retained_slice(&objects);
@@ -221,6 +241,35 @@ mod tests {
             write_payload(&pasteboard, payload.clone(), &mut retained).unwrap();
 
             assert_eq!(read_files(&pasteboard).unwrap(), Some(payload.files));
+        });
+    }
+
+    #[test]
+    fn nsurl_resolves_file_paths_and_file_references() {
+        autoreleasepool(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Finder file #1.txt");
+            std::fs::write(&path, b"contents").unwrap();
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+            let absolute = url.absoluteString().unwrap().to_string();
+            assert_eq!(
+                macos_path_from_file_uri(&absolute)
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap(),
+                path.canonicalize().unwrap()
+            );
+
+            if let Some(reference) = url.fileReferenceURL() {
+                let reference = reference.absoluteString().unwrap().to_string();
+                assert_eq!(
+                    macos_path_from_file_uri(&reference)
+                        .unwrap()
+                        .canonicalize()
+                        .unwrap(),
+                    path.canonicalize().unwrap()
+                );
+            }
         });
     }
 }
