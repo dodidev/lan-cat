@@ -57,6 +57,9 @@ pub fn bind() -> Result<UnixListener> {
         fs::create_dir_all(parent)?;
     }
     if path.exists() {
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            bail!("another daemon is already running");
+        }
         fs::remove_file(&path)?;
     }
     let listener = UnixListener::bind(&path)?;
