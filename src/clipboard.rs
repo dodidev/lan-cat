@@ -252,10 +252,19 @@ mod platform {
     }
 
     fn read_files(mimes: &std::collections::HashSet<String>) -> Result<Option<Vec<ClipboardFile>>> {
-        if !mimes.contains("text/uri-list") {
+        let mime = mimes
+            .iter()
+            .find(|mime| mime.split(';').next() == Some("text/uri-list"))
+            .map(String::as_str)
+            .or_else(|| {
+                mimes
+                    .contains("x-special/gnome-copied-files")
+                    .then_some("x-special/gnome-copied-files")
+            });
+        let Some(mime) = mime else {
             return Ok(None);
-        }
-        let bytes = read_mime(MimeType::Specific("text/uri-list"))?;
+        };
+        let bytes = read_mime(MimeType::Specific(mime))?;
         let list = String::from_utf8(bytes)?;
         let uris: Vec<_> = list
             .lines()
@@ -275,16 +284,23 @@ mod platform {
     ) -> Result<()> {
         if !payload.files.is_empty() {
             let paths = materialize_files(&payload.files, retained)?;
-            let mut list = paths
-                .iter()
-                .map(|path| file_uri(path))
-                .collect::<Vec<_>>()
-                .join("\r\n");
-            list.push_str("\r\n");
-            Options::new().copy(
-                Source::Bytes(list.into_bytes().into()),
-                CopyMime::Specific("text/uri-list".into()),
-            )?;
+            let uris = paths.iter().map(|path| file_uri(path)).collect::<Vec<_>>();
+            let uri_list = format!("{}\r\n", uris.join("\r\n"));
+            let gnome_list = format!("copy\n{}\n", uris.join("\n"));
+            Options::new().copy_multi(vec![
+                MimeSource {
+                    source: Source::Bytes(uri_list.into_bytes().into()),
+                    mime_type: CopyMime::Specific("text/uri-list".into()),
+                },
+                MimeSource {
+                    source: Source::Bytes(gnome_list.into_bytes().into()),
+                    mime_type: CopyMime::Specific("x-special/gnome-copied-files".into()),
+                },
+                MimeSource {
+                    source: Source::Bytes(b"0".to_vec().into()),
+                    mime_type: CopyMime::Specific("application/x-kde-cutselection".into()),
+                },
+            ])?;
             return Ok(());
         }
         let mut sources = Vec::new();
