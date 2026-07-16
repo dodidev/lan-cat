@@ -4,10 +4,17 @@ use uuid::Uuid;
 
 use crate::ordering::VersionVector;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_FILES: usize = 64;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClipboardFile {
+    pub name: String,
+    pub data: Vec<u8>,
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClipboardPayload {
@@ -15,6 +22,8 @@ pub struct ClipboardPayload {
     pub html: Option<String>,
     pub rtf: Option<String>,
     pub png: Option<Vec<u8>>,
+    #[serde(default)]
+    pub files: Vec<ClipboardFile>,
 }
 
 impl ClipboardPayload {
@@ -31,14 +40,48 @@ impl ClipboardPayload {
             + self.html.as_ref().map_or(0, |value| value.len())
             + self.rtf.as_ref().map_or(0, |value| value.len())
             + self.png.as_ref().map_or(0, Vec::len)
+            + self
+                .files
+                .iter()
+                .map(|file| file.name.len() + file.data.len())
+                .sum::<usize>()
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.text.is_none() && self.html.is_none() && self.rtf.is_none() && self.png.is_none() {
+        if self.text.is_none()
+            && self.html.is_none()
+            && self.rtf.is_none()
+            && self.png.is_none()
+            && self.files.is_empty()
+        {
             bail!("empty clipboard payload is not synchronized");
+        }
+        if !self.files.is_empty()
+            && (self.text.is_some()
+                || self.html.is_some()
+                || self.rtf.is_some()
+                || self.png.is_some())
+        {
+            bail!("file clipboard data cannot be mixed with other formats");
         }
         if self.total_bytes() > MAX_PAYLOAD_BYTES {
             bail!("clipboard payload exceeds {MAX_PAYLOAD_BYTES} bytes");
+        }
+        if self.files.len() > MAX_FILES {
+            bail!("clipboard payload exceeds {MAX_FILES} files");
+        }
+        let mut names = std::collections::HashSet::new();
+        for file in &self.files {
+            if file.name.is_empty()
+                || file.name == "."
+                || file.name == ".."
+                || file.name.contains(['/', '\\', '\0'])
+            {
+                bail!("invalid clipboard filename");
+            }
+            if !names.insert(&file.name) {
+                bail!("duplicate clipboard filename {}", file.name);
+            }
         }
         for (name, value) in [
             ("text/plain", self.text.as_deref()),
@@ -75,6 +118,14 @@ impl ClipboardPayload {
             self.rtf.as_ref().map(|v| v.as_bytes()),
         );
         digest_part(&mut hasher, b"image/png", self.png.as_deref());
+        hasher.update(b"files");
+        hasher.update(&(self.files.len() as u64).to_be_bytes());
+        for file in &self.files {
+            hasher.update(&(file.name.len() as u64).to_be_bytes());
+            hasher.update(file.name.as_bytes());
+            hasher.update(&(file.data.len() as u64).to_be_bytes());
+            hasher.update(&file.data);
+        }
         *hasher.finalize().as_bytes()
     }
 }
@@ -158,8 +209,35 @@ mod tests {
             html: Some("<b>hello</b>".into()),
             rtf: Some(r"{\rtf1 hello}".into()),
             png: Some(png()),
+            files: Vec::new(),
         };
         assert!(payload.validate().is_ok());
+    }
+
+    #[test]
+    fn file_payload_validation_and_digest() {
+        let payload = ClipboardPayload {
+            files: vec![ClipboardFile {
+                name: "report.txt".into(),
+                data: b"contents".to_vec(),
+            }],
+            ..Default::default()
+        };
+        assert!(payload.validate().is_ok());
+
+        let mut renamed = payload.clone();
+        renamed.files[0].name = "other.txt".into();
+        assert_ne!(payload.digest(), renamed.digest());
+
+        let mut traversal = payload.clone();
+        traversal.files[0].name = "../report.txt".into();
+        assert!(traversal.validate().is_err());
+
+        let mixed = ClipboardPayload {
+            text: Some("text".into()),
+            ..payload
+        };
+        assert!(mixed.validate().is_err());
     }
 
     #[test]
