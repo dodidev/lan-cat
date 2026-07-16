@@ -84,6 +84,20 @@ pub async fn run() -> Result<()> {
     let mut current: Option<ClipboardEvent> = None;
     let mut seen_order = VecDeque::new();
     let mut seen = HashSet::new();
+    if !cfg.read().await.paused {
+        if let Some(text) = clipboard.initial_text.take() {
+            let sequence = clock.increment(&id);
+            {
+                let mut value = cfg.write().await;
+                value.clock = clock.clone();
+                value.save()?;
+            }
+            let event = ClipboardEvent::new(id.clone(), sequence, clock.clone(), text)?;
+            remember(event.id, &mut seen, &mut seen_order);
+            current = Some(event.clone());
+            *latest.write().await = Some(event);
+        }
+    }
 
     loop {
         tokio::select! {

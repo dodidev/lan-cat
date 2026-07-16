@@ -12,6 +12,7 @@ enum Command {
 
 pub struct Clipboard {
     pub changes: async_mpsc::UnboundedReceiver<String>,
+    pub initial_text: Option<String>,
     commands: mpsc::Sender<Command>,
     pub backend: &'static str,
 }
@@ -20,9 +21,10 @@ impl Clipboard {
     pub fn start() -> Result<Self> {
         let (change_tx, change_rx) = async_mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::channel();
-        platform::spawn(change_tx, command_rx)?;
+        let initial_text = platform::spawn(change_tx, command_rx)?;
         Ok(Self {
             changes: change_rx,
+            initial_text,
             commands: command_tx,
             backend: platform::NAME,
         })
@@ -57,7 +59,7 @@ mod platform {
     pub fn spawn(
         changes: async_mpsc::UnboundedSender<String>,
         commands: mpsc::Receiver<Command>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         if std::env::var_os("WAYLAND_DISPLAY").is_none() {
             anyhow::bail!("WAYLAND_DISPLAY is not set; lan-cat requires a Wayland session");
         }
@@ -67,6 +69,7 @@ mod platform {
                 "Wayland clipboard unavailable: {error}. Compositor must support ext-data-control-v1 or wlr-data-control-v1"
             ),
         }
+        let initial = read_text().ok().filter(|text| validate_text(text).is_ok());
         thread::Builder::new()
             .name("lan-cat-wayland".into())
             .spawn(move || {
@@ -103,7 +106,7 @@ mod platform {
                     }
                 }
             })?;
-        Ok(())
+        Ok(initial)
     }
 
     fn read_text() -> Result<String> {
@@ -131,7 +134,8 @@ mod platform {
     pub fn spawn(
         changes: async_mpsc::UnboundedSender<String>,
         commands: mpsc::Receiver<Command>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
+        let initial = read_text().filter(|text| validate_text(text).is_ok());
         thread::Builder::new()
             .name("lan-cat-pasteboard".into())
             .spawn(move || {
@@ -173,7 +177,15 @@ mod platform {
                     }
                 });
             })?;
-        Ok(())
+        Ok(initial)
+    }
+
+    fn read_text() -> Option<String> {
+        autoreleasepool(|_| {
+            let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
+            unsafe { pasteboard.stringForType(NSPasteboardTypeString) }
+                .map(|value| value.to_string())
+        })
     }
 }
 
