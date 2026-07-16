@@ -48,7 +48,7 @@ pub(super) fn spawn(
                             count = pasteboard.changeCount();
                             injected_count = Some(count);
                         }
-                        Ok(Command::MarkFilesHandled(_)) => {}
+                        Ok(Command::MarkFilesHandled(paths)) => drop(paths),
                         Ok(Command::Rebaseline) => {
                             count = pasteboard.changeCount();
                             injected_count = None;
