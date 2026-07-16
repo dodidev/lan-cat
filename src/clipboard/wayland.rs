@@ -1,4 +1,11 @@
-use std::{collections::VecDeque, io::Read, sync::mpsc, thread, time::Duration};
+use std::{
+    collections::VecDeque,
+    io::Read,
+    process::{Command as ProcessCommand, Stdio},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 use anyhow::Result;
 use tokio::sync::mpsc as async_mpsc;
@@ -31,6 +38,8 @@ pub(super) fn spawn(
     let initial_file_paths = current_file_paths();
     let initial = initial_file_paths.is_none().then(read_payload).flatten();
     let initial_payload = initial.clone();
+    let (watch_tx, watch_rx) = mpsc::channel();
+    spawn_selection_watcher(watch_tx);
     thread::Builder::new()
         .name("lan-cat-wayland".into())
         .spawn(move || {
@@ -54,6 +63,10 @@ pub(super) fn spawn(
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
+                let mut selection_changed = false;
+                while watch_rx.try_recv().is_ok() {
+                    selection_changed = true;
+                }
                 let Some(change) = read_change() else {
                     continue;
                 };
@@ -63,7 +76,7 @@ pub(super) fn spawn(
                         payload
                     }
                     Change::Files(paths) => {
-                        if baseline_files.as_ref() == Some(paths) {
+                        if !selection_changed && baseline_files.as_ref() == Some(paths) {
                             continue;
                         }
                         baseline_files = Some(paths.clone());
@@ -87,6 +100,37 @@ pub(super) fn spawn(
             }
         })?;
     Ok(initial)
+}
+
+fn spawn_selection_watcher(changes: mpsc::Sender<()>) {
+    thread::Builder::new()
+        .name("lan-cat-wayland-watch".into())
+        .spawn(move || {
+            let mut child = match ProcessCommand::new("wl-paste")
+                .args(["--watch", "printf", "."])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::debug!(%error, "wl-paste selection watcher unavailable");
+                    return;
+                }
+            };
+            let Some(mut stdout) = child.stdout.take() else {
+                return;
+            };
+            let mut byte = [0_u8; 1];
+            while stdout.read(&mut byte).is_ok_and(|read| read > 0) {
+                if changes.send(()).is_err() {
+                    break;
+                }
+            }
+            let _ = child.kill();
+        })
+        .ok();
 }
 
 fn current_file_paths() -> Option<Vec<std::path::PathBuf>> {
@@ -145,24 +189,54 @@ fn read_files(mimes: &std::collections::HashSet<String>) -> Result<Option<Vec<Cl
 fn read_file_path_list(
     mimes: &std::collections::HashSet<String>,
 ) -> Result<Option<Vec<std::path::PathBuf>>> {
-    let mime = mimes
-        .iter()
-        .find(|mime| mime.split(';').next() == Some("text/uri-list"))
-        .map(String::as_str)
-        .or_else(|| {
-            mimes
-                .contains("x-special/gnome-copied-files")
-                .then_some("x-special/gnome-copied-files")
-        });
-    let Some(mime) = mime else {
+    let candidates = file_mime_candidates(mimes);
+    if candidates.is_empty() {
         return Ok(None);
-    };
-    let bytes = read_mime(MimeType::Specific(mime))?;
-    let list = String::from_utf8(bytes)?;
+    }
+    let mut last_error = None;
+    for mime in candidates {
+        match read_mime(MimeType::Specific(mime)) {
+            Ok(bytes) => {
+                let list = String::from_utf8(bytes)?;
+                if let Some(paths) = parse_file_uri_list(&list)? {
+                    tracing::debug!(%mime, files = paths.len(), "detected copied file list");
+                    return Ok(Some(paths));
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%mime, %error, "failed to read file clipboard MIME data");
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    Ok(None)
+}
+
+fn file_mime_candidates(mimes: &std::collections::HashSet<String>) -> Vec<&str> {
+    let mut values = Vec::new();
+    for wanted in ["x-special/gnome-copied-files", "text/uri-list"] {
+        for mime in mimes {
+            if mime
+                .split(';')
+                .next()
+                .is_some_and(|base| base.eq_ignore_ascii_case(wanted))
+            {
+                values.push(mime.as_str());
+            }
+        }
+    }
+    values
+}
+
+fn parse_file_uri_list(list: &str) -> Result<Option<Vec<std::path::PathBuf>>> {
     let uris: Vec<_> = list
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| *line != "copy" && *line != "cut")
         .filter(|line| line.starts_with("file://"))
         .collect();
     if uris.is_empty() {
@@ -266,4 +340,35 @@ fn read_mime(mime: MimeType<'_>) -> Result<Vec<u8>> {
         anyhow::bail!("clipboard data exceeds size limit");
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_mime_candidates_prefer_gnome_then_uri_list_case_insensitive() {
+        let mimes = [
+            "TEXT/URI-LIST;charset=utf-8".to_owned(),
+            "x-special/gnome-copied-files".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            file_mime_candidates(&mimes),
+            vec![
+                "x-special/gnome-copied-files",
+                "TEXT/URI-LIST;charset=utf-8"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_file_uri_list_ignores_gnome_operation_line() {
+        let parsed = parse_file_uri_list("copy\nfile:///tmp/report%201.txt\n# comment\n").unwrap();
+        assert_eq!(
+            parsed.unwrap(),
+            vec![std::path::PathBuf::from("/tmp/report 1.txt")]
+        );
+    }
 }

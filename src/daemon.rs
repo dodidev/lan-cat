@@ -264,13 +264,18 @@ fn spawn_copy_prompt(paths: Vec<std::path::PathBuf>) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/lan-cat-copy-prompt.log")
+        .context("open copy prompt log")?;
     std::process::Command::new(std::env::current_exe()?)
         .arg("copy-share-ui")
         .arg("--")
         .args(paths)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log))
         .spawn()
         .context("launch copied-file prompt")?;
     Ok(())
