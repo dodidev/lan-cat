@@ -46,19 +46,27 @@ pub(super) fn spawn(
             let mut baseline = initial_payload;
             let mut baseline_files = initial_file_paths;
             let mut injected: Option<[u8; 32]> = None;
+            let mut injected_files: Option<Vec<std::path::PathBuf>> = None;
             let mut retained = VecDeque::new();
             loop {
                 match commands.recv_timeout(Duration::from_millis(250)) {
                     Ok(Command::Set(payload)) => {
-                        injected = Some(payload.digest());
-                        if let Err(error) = write_payload(payload, &mut retained) {
-                            tracing::warn!(%error, "failed to write Wayland clipboard");
+                        let digest = payload.digest();
+                        match write_payload(payload, &mut retained) {
+                            Ok(paths) => {
+                                injected = Some(digest);
+                                injected_files = paths;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to write Wayland clipboard");
+                            }
                         }
                     }
                     Ok(Command::Rebaseline) => {
                         baseline_files = current_file_paths();
                         baseline = baseline_files.is_none().then(read_payload).flatten();
                         injected = None;
+                        injected_files = None;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -81,6 +89,9 @@ pub(super) fn spawn(
                         }
                         baseline_files = Some(paths.clone());
                         baseline = None;
+                        if injected_files.as_ref() == Some(paths) {
+                            continue;
+                        }
                         if injected.take().is_some() {
                             continue;
                         }
@@ -92,6 +103,7 @@ pub(super) fn spawn(
                     continue;
                 }
                 baseline = Some(payload.clone());
+                injected_files = None;
                 let digest = payload.digest();
                 if injected.take() == Some(digest) {
                     continue;
@@ -248,7 +260,7 @@ fn parse_file_uri_list(list: &str) -> Result<Option<Vec<std::path::PathBuf>>> {
 fn write_payload(
     payload: ClipboardPayload,
     retained: &mut VecDeque<tempfile::TempDir>,
-) -> Result<()> {
+) -> Result<Option<Vec<std::path::PathBuf>>> {
     if !payload.files.is_empty() {
         let paths = materialize_files(&payload.files, retained)?;
         let uris = paths.iter().map(|path| file_uri(path)).collect::<Vec<_>>();
@@ -268,7 +280,7 @@ fn write_payload(
                 mime_type: CopyMime::Specific("application/x-kde-cutselection".into()),
             },
         ])?;
-        return Ok(());
+        return Ok(Some(paths));
     }
     let mut sources = Vec::new();
     if let Some(text) = payload.text {
@@ -296,7 +308,7 @@ fn write_payload(
         });
     }
     Options::new().copy_multi(sources)?;
-    Ok(())
+    Ok(None)
 }
 
 fn read_text() -> Result<String> {
