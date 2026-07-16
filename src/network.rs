@@ -321,12 +321,12 @@ impl SecureConnection {
             if wanted_group.get_or_insert(group) != &group
                 || got_index != index
                 || total == 0
-                || total > 32
+                || total > 512
             {
                 bail!("invalid application chunk sequence");
             }
             all.extend_from_slice(&plain[CHUNK_HEADER..]);
-            if all.len() > crate::protocol::MAX_TEXT_BYTES + 64 * 1024 {
+            if all.len() > crate::protocol::MAX_PAYLOAD_BYTES + 256 * 1024 {
                 bail!("application message too large");
             }
             if index + 1 == total {
@@ -413,7 +413,10 @@ fn decrypt_record(state: &mut TransportState, encrypted: &[u8]) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ordering::VersionVector, protocol::ClipboardEvent};
+    use crate::{
+        ordering::VersionVector,
+        protocol::{ClipboardEvent, ClipboardPayload},
+    };
 
     fn test_config(name: &str) -> Config {
         let params = "Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
@@ -465,13 +468,17 @@ mod tests {
             .unwrap();
         let mut clock = VersionVector::default();
         let sequence = clock.increment(&right_id);
-        let text = "x".repeat(crate::protocol::MAX_TEXT_BYTES);
-        let event = ClipboardEvent::new(right_id, sequence, clock, text).unwrap();
+        let text = "x".repeat(crate::protocol::MAX_PAYLOAD_BYTES);
+        let event =
+            ClipboardEvent::new(right_id, sequence, clock, ClipboardPayload::text(text)).unwrap();
         connection.send(&Message::Clipboard(event)).await.unwrap();
         let Message::Clipboard(received) = server.await.unwrap() else {
             panic!("wrong message")
         };
         received.validate().unwrap();
-        assert_eq!(received.text.len(), crate::protocol::MAX_TEXT_BYTES);
+        assert_eq!(
+            received.payload.text.unwrap().len(),
+            crate::protocol::MAX_PAYLOAD_BYTES
+        );
     }
 }

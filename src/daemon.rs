@@ -85,14 +85,14 @@ pub async fn run() -> Result<()> {
     let mut seen_order = VecDeque::new();
     let mut seen = HashSet::new();
     if !cfg.read().await.paused {
-        if let Some(text) = clipboard.initial_text.take() {
+        if let Some(payload) = clipboard.initial_payload.take() {
             let sequence = clock.increment(&id);
             {
                 let mut value = cfg.write().await;
                 value.clock = clock.clone();
                 value.save()?;
             }
-            let event = ClipboardEvent::new(id.clone(), sequence, clock.clone(), text)?;
+            let event = ClipboardEvent::new(id.clone(), sequence, clock.clone(), payload)?;
             remember(event.id, &mut seen, &mut seen_order);
             current = Some(event.clone());
             *latest.write().await = Some(event);
@@ -102,7 +102,7 @@ pub async fn run() -> Result<()> {
     loop {
         tokio::select! {
             local = clipboard.changes.recv() => {
-                let Some(text) = local else { bail!("clipboard backend stopped"); };
+                let Some(payload) = local else { bail!("clipboard backend stopped"); };
                 if cfg.read().await.paused { continue; }
                 let sequence = clock.increment(&id);
                 {
@@ -110,7 +110,7 @@ pub async fn run() -> Result<()> {
                     value.clock = clock.clone();
                     value.save()?;
                 }
-                let event = ClipboardEvent::new(id.clone(), sequence, clock.clone(), text)?;
+                let event = ClipboardEvent::new(id.clone(), sequence, clock.clone(), payload)?;
                 remember(event.id, &mut seen, &mut seen_order);
                 current = Some(event.clone());
                 *latest.write().await = Some(event.clone());
@@ -143,7 +143,7 @@ pub async fn run() -> Result<()> {
                 // Forward every valid unseen event; each peer applies same deterministic ordering.
                 let _ = bus_tx.send(BusEvent { source: Some(peer), message: Message::Clipboard(event.clone()) });
                 if wins {
-                    clipboard.set_text(event.text.clone())?;
+                    clipboard.set_payload(event.payload.clone())?;
                     current = Some(event.clone());
                     *latest.write().await = Some(event);
                 }
