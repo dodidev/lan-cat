@@ -10,17 +10,19 @@ use tokio::{
 };
 
 use crate::{
-    clipboard::Clipboard,
+    clipboard::{Change as ClipboardChange, Clipboard},
     config::Config,
     ipc::{self, Response},
     network::{self, SecureConnection},
     ordering::ClockRelation,
     protocol::{ClipboardEvent, Message, PROTOCOL_VERSION},
+    transfer::{self, Manager as TransferManager},
 };
 
 #[derive(Clone, Debug)]
 struct BusEvent {
     source: Option<String>,
+    target: Option<String>,
     message: Message,
 }
 
@@ -61,6 +63,8 @@ pub async fn run() -> Result<()> {
     let (bus_tx, _) = broadcast::channel::<BusEvent>(128);
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<Incoming>();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Control>();
+    let (transfer_tx, mut transfer_rx) = mpsc::unbounded_channel();
+    let transfers = TransferManager::new(transfer_tx);
 
     let network = NetworkContext {
         cfg: cfg.clone(),
@@ -77,6 +81,7 @@ pub async fn run() -> Result<()> {
         backend,
         control_tx,
         bus_tx.clone(),
+        transfers.clone(),
     ));
 
     tracing::info!(device_id = %id, %port, backend, "lan-cat daemon started");
@@ -102,8 +107,16 @@ pub async fn run() -> Result<()> {
     loop {
         tokio::select! {
             local = clipboard.changes.recv() => {
-                let Some(payload) = local else { bail!("clipboard backend stopped"); };
+                let Some(change) = local else { bail!("clipboard backend stopped"); };
                 if cfg.read().await.paused { continue; }
+                let ClipboardChange::Payload(payload) = change else {
+                    if let ClipboardChange::Files(paths) = change {
+                        if let Err(error) = spawn_copy_prompt(paths) {
+                            tracing::warn!(%error, "failed to open copied-file prompt");
+                        }
+                    }
+                    continue;
+                };
                 let sequence = clock.increment(&id);
                 {
                     let mut value = cfg.write().await;
@@ -114,10 +127,16 @@ pub async fn run() -> Result<()> {
                 remember(event.id, &mut seen, &mut seen_order);
                 current = Some(event.clone());
                 *latest.write().await = Some(event.clone());
-                let _ = bus_tx.send(BusEvent { source: None, message: Message::Clipboard(event) });
+                let _ = bus_tx.send(BusEvent { source: None, target: None, message: Message::Clipboard(event) });
             }
             incoming = incoming_rx.recv() => {
                 let Some(Incoming { peer, message }) = incoming else { bail!("network manager stopped"); };
+                if let Message::Transfer(message) = message {
+                    if let Err(error) = transfers.handle(peer, message).await {
+                        tracing::warn!(%error, "rejected file transfer message");
+                    }
+                    continue;
+                }
                 let Message::Clipboard(event) = message else { continue };
                 if cfg.read().await.paused || seen.contains(&event.id) { continue; }
                 if let Err(error) = event.validate() {
@@ -141,7 +160,7 @@ pub async fn run() -> Result<()> {
                     ClockRelation::Before | ClockRelation::Equal => false,
                 });
                 // Forward every valid unseen event; each peer applies same deterministic ordering.
-                let _ = bus_tx.send(BusEvent { source: Some(peer), message: Message::Clipboard(event.clone()) });
+                let _ = bus_tx.send(BusEvent { source: Some(peer), target: None, message: Message::Clipboard(event.clone()) });
                 if wins {
                     clipboard.set_payload(event.payload.clone())?;
                     current = Some(event.clone());
@@ -157,9 +176,35 @@ pub async fn run() -> Result<()> {
                 }
                 None => bail!("IPC control channel stopped"),
             },
+            outbound = transfer_rx.recv() => {
+                let Some(transfer::Outbound { peer, message }) = outbound else {
+                    bail!("transfer manager stopped");
+                };
+                let _ = bus_tx.send(BusEvent {
+                    source: None,
+                    target: Some(peer),
+                    message: Message::Transfer(message),
+                });
+            }
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    Ok(())
+}
+
+fn spawn_copy_prompt(paths: Vec<std::path::PathBuf>) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    std::process::Command::new(std::env::current_exe()?)
+        .arg("copy-share-ui")
+        .arg("--")
+        .args(paths)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("launch copied-file prompt")?;
     Ok(())
 }
 
@@ -331,6 +376,7 @@ async fn peer_loop(
             event = outbound.recv() => {
                 let event = event?;
                 if event.source.as_deref() == Some(peer_id) { continue; }
+                if event.target.as_deref().is_some_and(|target| target != peer_id) { continue; }
                 if !cfg.read().await.peers.contains_key(peer_id) { bail!("peer was unpaired"); }
                 connection.send(&event.message).await?;
             }
@@ -345,6 +391,7 @@ async fn ipc_server(
     backend: &'static str,
     control: mpsc::UnboundedSender<Control>,
     bus: broadcast::Sender<BusEvent>,
+    transfers: Arc<TransferManager>,
 ) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -354,12 +401,16 @@ async fn ipc_server(
         let active = active.clone();
         let control = control.clone();
         let bus = bus.clone();
+        let transfers = transfers.clone();
         tokio::spawn(async move {
             let response = match ipc::read(&mut stream).await {
-                Ok(request) => handle_ipc(request, cfg, active, backend, control, bus).await,
+                Ok(request) => {
+                    handle_ipc(request, cfg, active, backend, control, bus, transfers).await
+                }
                 Err(error) => Response {
                     ok: false,
                     message: error.to_string(),
+                    data: None,
                 },
             };
             let _ = ipc::write(&mut stream, response).await;
@@ -374,16 +425,20 @@ async fn handle_ipc(
     backend: &'static str,
     control: mpsc::UnboundedSender<Control>,
     bus: broadcast::Sender<BusEvent>,
+    transfers: Arc<TransferManager>,
 ) -> Response {
-    let result: Result<String> = async {
+    let result: Result<(String, Option<ipc::ResponseData>)> = async {
         match request {
             ipc::Request::Status => {
                 let cfg = cfg.read().await;
-                Ok(format!(
-                    "{}; backend={backend}; paired={}; connected={}",
-                    if cfg.paused { "paused" } else { "running" },
-                    cfg.peers.len(),
-                    active.lock().await.len()
+                Ok((
+                    format!(
+                        "{}; backend={backend}; paired={}; connected={}",
+                        if cfg.paused { "paused" } else { "running" },
+                        cfg.peers.len(),
+                        active.lock().await.len()
+                    ),
+                    None,
                 ))
             }
             ipc::Request::Pause => {
@@ -391,14 +446,20 @@ async fn handle_ipc(
                 value.paused = true;
                 value.save()?;
                 control.send(Control::Pause)?;
-                Ok("Synchronization paused; queued content discarded.".into())
+                Ok((
+                    "Synchronization paused; queued content discarded.".into(),
+                    None,
+                ))
             }
             ipc::Request::Resume => {
                 let mut value = cfg.write().await;
                 value.paused = false;
                 value.save()?;
                 control.send(Control::Resume)?;
-                Ok("Synchronization resumed from current clipboard baseline.".into())
+                Ok((
+                    "Synchronization resumed from current clipboard baseline.".into(),
+                    None,
+                ))
             }
             ipc::Request::Unpair { peer } => {
                 let mut value = cfg.write().await;
@@ -416,18 +477,77 @@ async fn handle_ipc(
                 value.save()?;
                 let _ = bus.send(BusEvent {
                     source: None,
+                    target: None,
                     message: Message::Ping,
                 });
-                Ok(format!("Unpaired {id}."))
+                Ok((format!("Unpaired {id}."), None))
+            }
+            ipc::Request::PeerList => {
+                let cfg = cfg.read().await;
+                let connected = active.lock().await;
+                let peers = cfg
+                    .peers
+                    .iter()
+                    .map(|(id, peer)| ipc::PeerView {
+                        id: id.clone(),
+                        name: peer.name.clone(),
+                        connected: connected.contains(id),
+                    })
+                    .collect();
+                Ok((
+                    "Peer list.".into(),
+                    Some(ipc::ResponseData::Peers { peers }),
+                ))
+            }
+            ipc::Request::TransferStart { peer, paths } => {
+                if !active.lock().await.contains(&peer) {
+                    bail!("selected peer is not connected");
+                }
+                let id = transfers.start(peer, paths).await?;
+                Ok((
+                    format!("Transfer {id} offered."),
+                    Some(ipc::ResponseData::Started { id }),
+                ))
+            }
+            ipc::Request::TransferList => {
+                let values = transfers.views().await;
+                Ok((
+                    "Transfer list.".into(),
+                    Some(ipc::ResponseData::Transfers { transfers: values }),
+                ))
+            }
+            ipc::Request::TransferGet { id } => {
+                let transfer = transfers.view(id).await.context("unknown transfer")?;
+                Ok((
+                    "Transfer status.".into(),
+                    Some(ipc::ResponseData::Transfer { transfer }),
+                ))
+            }
+            ipc::Request::TransferAccept { id, destination } => {
+                transfers.accept(id, destination).await?;
+                Ok(("Transfer accepted.".into(), None))
+            }
+            ipc::Request::TransferReject { id } => {
+                transfers.reject(id).await?;
+                Ok(("Transfer rejected.".into(), None))
+            }
+            ipc::Request::TransferCancel { id } => {
+                transfers.cancel(id).await?;
+                Ok(("Transfer cancelled.".into(), None))
             }
         }
     }
     .await;
     match result {
-        Ok(message) => Response { ok: true, message },
+        Ok((message, data)) => Response {
+            ok: true,
+            message,
+            data,
+        },
         Err(error) => Response {
             ok: false,
             message: error.to_string(),
+            data: None,
         },
     }
 }

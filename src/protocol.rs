@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::ordering::VersionVector;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_FILES: usize = 64;
 
@@ -189,6 +189,7 @@ impl ClipboardEvent {
 pub enum Message {
     Hello { version: u16, device_id: String },
     Clipboard(ClipboardEvent),
+    Transfer(crate::transfer::protocol::TransferMessage),
     Ping,
 }
 

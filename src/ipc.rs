@@ -1,4 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    io::BufRead,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -8,6 +13,7 @@ use tokio::{
 };
 
 use crate::config;
+use crate::transfer::TransferView;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -15,16 +21,61 @@ pub enum Request {
     Status,
     Pause,
     Resume,
-    Unpair { peer: String },
+    Unpair {
+        peer: String,
+    },
+    TransferStart {
+        peer: String,
+        paths: Vec<PathBuf>,
+    },
+    PeerList,
+    TransferList,
+    TransferGet {
+        id: uuid::Uuid,
+    },
+    TransferAccept {
+        id: uuid::Uuid,
+        destination: PathBuf,
+    },
+    TransferReject {
+        id: uuid::Uuid,
+    },
+    TransferCancel {
+        id: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<ResponseData>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseData {
+    Transfer { transfer: TransferView },
+    Transfers { transfers: Vec<TransferView> },
+    Started { id: uuid::Uuid },
+    Peers { peers: Vec<PeerView> },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerView {
+    pub id: String,
+    pub name: String,
+    pub connected: bool,
 }
 
 pub async fn request(request: Request) -> Result<()> {
+    let response = call(request).await?;
+    println!("{}", response.message);
+    Ok(())
+}
+
+pub async fn call(request: Request) -> Result<Response> {
     let path = config::runtime_socket()?;
     let mut stream = UnixStream::connect(&path).await.with_context(|| {
         format!(
@@ -37,9 +88,24 @@ pub async fn request(request: Request) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).await?;
     let response: Response = serde_json::from_str(&line)?;
-    println!("{}", response.message);
     if response.ok {
-        Ok(())
+        Ok(response)
+    } else {
+        bail!(response.message)
+    }
+}
+
+pub fn call_blocking(request: &Request) -> Result<Response> {
+    let path = config::runtime_socket()?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&path)
+        .with_context(|| format!("connect daemon at {}", path.display()))?;
+    stream.write_all(&serde_json::to_vec(request)?)?;
+    stream.write_all(b"\n")?;
+    let mut line = String::new();
+    std::io::BufReader::new(stream).read_line(&mut line)?;
+    let response: Response = serde_json::from_str(&line)?;
+    if response.ok {
+        Ok(response)
     } else {
         bail!(response.message)
     }
@@ -72,7 +138,7 @@ pub async fn read(stream: &mut UnixStream) -> Result<Request> {
     verify_same_user(stream)?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).await?;
-    if line.len() > 4096 {
+    if line.len() > 64 * 1024 {
         bail!("IPC request too large");
     }
     Ok(serde_json::from_str(&line)?)

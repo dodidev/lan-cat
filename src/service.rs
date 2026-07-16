@@ -83,6 +83,10 @@ async fn start() -> Result<()> {
             "import-environment",
             "WAYLAND_DISPLAY",
             "XDG_RUNTIME_DIR",
+            "DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_TYPE",
         ],
     )
     .await?;

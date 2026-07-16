@@ -1,14 +1,19 @@
 mod clipboard;
 mod config;
 mod daemon;
+mod gui;
+mod integration;
 mod ipc;
 mod network;
 mod ordering;
 mod protocol;
 mod service;
+mod transfer;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -33,6 +38,30 @@ enum Command {
     Resume,
     /// Show daemon and platform status.
     Status,
+    /// Open GUI to share files with a paired peer.
+    Share {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        peer: Option<String>,
+    },
+    /// Open transfer history window.
+    Transfers,
+    #[command(hide = true)]
+    TransferUi {
+        #[arg(long)]
+        id: Uuid,
+    },
+    #[command(hide = true)]
+    CopyShareUi {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Install or remove Finder/Thunar sharing actions.
+    Integration {
+        #[command(subcommand)]
+        action: IntegrationAction,
+    },
     /// Read or change device name.
     Name { name: Option<String> },
     /// Manage manual-start user service.
@@ -48,6 +77,12 @@ enum ServiceAction {
     Start,
     Stop,
     Status,
+    Uninstall,
+}
+
+#[derive(Clone, Subcommand)]
+enum IntegrationAction {
+    Install,
     Uninstall,
 }
 
@@ -76,6 +111,11 @@ async fn main() -> Result<()> {
         Command::Pause => ipc::request(ipc::Request::Pause).await,
         Command::Resume => ipc::request(ipc::Request::Resume).await,
         Command::Status => ipc::request(ipc::Request::Status).await,
+        Command::Share { paths, peer } => gui::share(paths, peer),
+        Command::Transfers => gui::transfers(),
+        Command::TransferUi { id } => gui::receive(id),
+        Command::CopyShareUi { paths } => gui::copy_prompt(paths),
+        Command::Integration { action } => integration::run(action),
         Command::Name { name: None } => {
             println!("{}", config::Config::load_or_create()?.name);
             Ok(())
