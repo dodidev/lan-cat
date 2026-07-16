@@ -44,7 +44,10 @@ struct NetworkContext {
 enum Control {
     Pause,
     Resume,
-    SyncPayload(crate::protocol::ClipboardPayload),
+    SyncFiles {
+        payload: crate::protocol::ClipboardPayload,
+        paths: Vec<std::path::PathBuf>,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -176,7 +179,8 @@ pub async fn run() -> Result<()> {
                     current = None;
                     *latest.write().await = None;
                 }
-                Some(Control::SyncPayload(payload)) => {
+                Some(Control::SyncFiles { payload, paths }) => {
+                    clipboard.mark_files_handled(paths)?;
                     publish_local_payload(
                         payload,
                         &id,
@@ -538,11 +542,15 @@ async fn handle_ipc(
                 if cfg.read().await.paused {
                     bail!("clipboard synchronization is paused");
                 }
+                let handled_paths = paths.clone();
                 let payload = tokio::task::spawn_blocking(move || {
                     crate::clipboard::payload_from_paths(paths)
                 })
                 .await??;
-                control.send(Control::SyncPayload(payload))?;
+                control.send(Control::SyncFiles {
+                    payload,
+                    paths: handled_paths,
+                })?;
                 Ok(("Files queued for clipboard synchronization.".into(), None))
             }
             ipc::Request::Unpair { peer } => {

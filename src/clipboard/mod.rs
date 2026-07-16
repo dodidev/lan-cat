@@ -22,6 +22,7 @@ compile_error!("lan-cat supports only Linux and macOS");
 
 pub(super) enum Command {
     Set(ClipboardPayload),
+    MarkFilesHandled(Vec<PathBuf>),
     Rebaseline,
 }
 
@@ -63,6 +64,12 @@ impl Clipboard {
         payload.validate()?;
         self.commands
             .send(Command::Set(payload))
+            .context("clipboard backend stopped")
+    }
+
+    pub fn mark_files_handled(&self, paths: Vec<PathBuf>) -> Result<()> {
+        self.commands
+            .send(Command::MarkFilesHandled(paths))
             .context("clipboard backend stopped")
     }
 

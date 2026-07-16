@@ -47,6 +47,7 @@ pub(super) fn spawn(
             let mut baseline_files = initial_file_paths;
             let mut injected: Option<[u8; 32]> = None;
             let mut injected_files: Option<Vec<std::path::PathBuf>> = None;
+            let mut handled_files: Option<Vec<std::path::PathBuf>> = None;
             let mut retained = VecDeque::new();
             loop {
                 match commands.recv_timeout(Duration::from_millis(250)) {
@@ -61,6 +62,12 @@ pub(super) fn spawn(
                                 tracing::warn!(%error, "failed to write Wayland clipboard");
                             }
                         }
+                    }
+                    Ok(Command::MarkFilesHandled(paths)) => {
+                        baseline_files = Some(paths.clone());
+                        injected_files = Some(paths.clone());
+                        handled_files = Some(paths);
+                        injected = None;
                     }
                     Ok(Command::Rebaseline) => {
                         baseline_files = current_file_paths();
@@ -81,14 +88,19 @@ pub(super) fn spawn(
                 let payload = match &change {
                     Change::Payload(payload) => {
                         baseline_files = None;
+                        handled_files = None;
                         payload
                     }
                     Change::Files(paths) => {
+                        if !selection_changed && handled_files.as_ref() == Some(paths) {
+                            continue;
+                        }
                         if !selection_changed && baseline_files.as_ref() == Some(paths) {
                             continue;
                         }
                         baseline_files = Some(paths.clone());
                         baseline = None;
+                        handled_files = None;
                         if injected_files.as_ref() == Some(paths) {
                             continue;
                         }
