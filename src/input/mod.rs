@@ -215,6 +215,15 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             if *active == peer { *acknowledged = true; }
                         }
                     }
+                    InputMessage::Cancel => {
+                        if outgoing.as_ref().is_some_and(|value| outgoing_peer(value) == peer) {
+                            outgoing = None;
+                            capture.release();
+                        }
+                        if preview.as_ref().is_some_and(|value| value.peer == peer) {
+                            if let Some(mut value) = preview.take() { value.beacon.cancel(); }
+                        }
+                    }
                     InputMessage::Enter { edge, position } => {
                         if takeover.as_ref().is_some_and(|(active, started, _)| {
                             *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME

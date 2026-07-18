@@ -127,7 +127,7 @@ fn spawn_local_input_monitor(events: mpsc::UnboundedSender<CaptureEvent>) {
         .name("lan-cat-linux-input-monitor".into())
         .spawn(move || {
             if let Err(error) = run_local_input_monitor(events) {
-                tracing::debug!(%error, "local input takeover disabled");
+                tracing::warn!(%error, "local input takeover disabled");
             }
         })
         .ok();
@@ -930,11 +930,16 @@ impl Injector {
 
     pub fn apply_keyboard(&mut self, input: KeyboardInput) -> Result<()> {
         if input.state == 0 {
+            self.state.keyboard.key(now_ms(), input.key, input.state);
             self.held_keys.remove(&input.key);
         } else {
             self.held_keys.insert(input.key);
+            self.state
+                .keyboard
+                .modifiers(modifiers(&self.held_keys), 0, 0, 0);
+            self.state.keyboard.key(now_ms(), input.key, input.state);
+            return self.flush();
         }
-        self.state.keyboard.key(now_ms(), input.key, input.state);
         self.state
             .keyboard
             .modifiers(modifiers(&self.held_keys), 0, 0, 0);

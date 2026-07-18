@@ -87,6 +87,8 @@ pub enum InputMessage {
         progress: f32,
     },
     ProbeAck,
+    /// Deprecated wire value kept so CBOR enum indexes stay compatible.
+    Cancel,
     Enter {
         edge: Edge,
         position: f64,
