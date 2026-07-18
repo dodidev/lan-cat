@@ -710,7 +710,7 @@ impl Injector {
         let manager: ZwlrVirtualPointerManagerV1 = globals
             .bind(&qh, 1..=2, ())
             .map_err(|_| anyhow!("wlr-virtual-pointer protocol unavailable"))?;
-        let pointer = manager.create_virtual_pointer(None, &qh, ());
+        let pointer = manager.create_virtual_pointer(Some(&seat), &qh, ());
         let keyboard_manager: ZwpVirtualKeyboardManagerV1 = globals
             .bind(&qh, 1..=1, ())
             .map_err(|_| anyhow!("virtual-keyboard protocol unavailable"))?;
