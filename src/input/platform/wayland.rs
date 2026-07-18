@@ -1,6 +1,9 @@
 use std::{
     collections::HashSet,
+    fs::{self, File},
+    io,
     os::fd::{AsFd, AsRawFd},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -60,6 +63,22 @@ use crate::input::protocol::{Edge, KeyboardInput, PointerInput};
 
 const EDGE_THICKNESS: u32 = 2;
 const POOL_BYTES: usize = 512 * 1024;
+const EV_KEY: u16 = 0x01;
+const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
+const XKB_MOD_SHIFT: u32 = 1 << 0;
+const XKB_MOD_CONTROL: u32 = 1 << 2;
+const XKB_MOD_ALT: u32 = 1 << 3;
+const XKB_MOD_LOGO: u32 = 1 << 6;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxInputEvent {
+    _time: libc::timeval,
+    kind: u16,
+    _code: u16,
+    value: i32,
+}
 
 pub struct Capture {
     pub events: mpsc::UnboundedReceiver<CaptureEvent>,
@@ -72,16 +91,18 @@ impl Capture {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let active = Arc::new(AtomicBool::new(false));
         let thread_active = active.clone();
+        let capture_events_tx = events_tx.clone();
 
         thread::Builder::new()
             .name("lan-cat-wayland-capture".into())
             .spawn(move || {
-                let result = run_capture(events_tx, thread_active, ready_tx.clone());
+                let result = run_capture(capture_events_tx, thread_active, ready_tx.clone());
                 if let Err(error) = result {
                     let _ = ready_tx.send(Err(error));
                 }
             })
             .context("spawn Wayland capture thread")?;
+        spawn_local_input_monitor(events_tx);
 
         tokio::task::spawn_blocking(move || ready_rx.recv())
             .await
@@ -93,6 +114,115 @@ impl Capture {
     pub fn release(&self) {
         self.active.store(false, Ordering::Release);
     }
+}
+
+fn spawn_local_input_monitor(events: mpsc::UnboundedSender<CaptureEvent>) {
+    thread::Builder::new()
+        .name("lan-cat-linux-input-monitor".into())
+        .spawn(move || {
+            if let Err(error) = run_local_input_monitor(events) {
+                tracing::debug!(%error, "local input takeover disabled");
+            }
+        })
+        .ok();
+}
+
+fn run_local_input_monitor(events: mpsc::UnboundedSender<CaptureEvent>) -> Result<()> {
+    let mut devices = open_input_devices("/dev/input")?;
+    if devices.is_empty() {
+        bail!("no readable /dev/input/event* devices");
+    }
+    let event_size = size_of::<LinuxInputEvent>();
+    let mut buffer = vec![0_u8; event_size * 32];
+
+    loop {
+        let mut pollfds: Vec<_> = devices
+            .iter()
+            .map(|device| libc::pollfd {
+                fd: device.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let ready =
+            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 1000) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            bail!("poll /dev/input failed: {error}");
+        }
+
+        for (index, pollfd) in pollfds.iter().enumerate().rev() {
+            if pollfd.revents & libc::POLLNVAL != 0 {
+                devices.swap_remove(index);
+                continue;
+            }
+            if pollfd.revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let bytes = unsafe {
+                libc::read(
+                    devices[index].as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if bytes < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::WouldBlock
+                    && error.kind() != io::ErrorKind::Interrupted
+                {
+                    devices.swap_remove(index);
+                }
+                continue;
+            }
+            if has_physical_input(&buffer[..bytes as usize]) {
+                let _ = events.send(CaptureEvent::LocalInput);
+            }
+        }
+
+        if devices.is_empty() {
+            devices = open_input_devices("/dev/input")?;
+        }
+    }
+}
+
+fn open_input_devices(path: impl AsRef<Path>) -> Result<Vec<File>> {
+    let mut devices = Vec::new();
+    let entries = fs::read_dir(path)?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("event") {
+            continue;
+        }
+        match File::open(entry.path()) {
+            Ok(file) => {
+                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                if flags >= 0 {
+                    unsafe {
+                        libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+                }
+                devices.push(file);
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(_) => {}
+        }
+    }
+    Ok(devices)
+}
+
+fn has_physical_input(buffer: &[u8]) -> bool {
+    for chunk in buffer.chunks_exact(size_of::<LinuxInputEvent>()) {
+        let event = unsafe { chunk.as_ptr().cast::<LinuxInputEvent>().read_unaligned() };
+        if matches!(event.kind, EV_KEY | EV_REL | EV_ABS) && event.value != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 struct EdgeLayer {
@@ -785,6 +915,9 @@ impl Injector {
             self.held_keys.insert(input.key);
         }
         self.state.keyboard.key(now_ms(), input.key, input.state);
+        self.state
+            .keyboard
+            .modifiers(modifiers(&self.held_keys), 0, 0, 0);
         self.flush()
     }
 
@@ -792,6 +925,7 @@ impl Injector {
         for key in self.held_keys.drain() {
             self.state.keyboard.key(now_ms(), key, 0);
         }
+        self.state.keyboard.modifiers(0, 0, 0, 0);
         self.pointer.frame();
         self.flush()
     }
@@ -818,6 +952,20 @@ fn now_ms() -> u32 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u32
+}
+
+fn modifiers(held_keys: &HashSet<u32>) -> u32 {
+    let mut mods = 0;
+    for key in held_keys {
+        mods |= match *key {
+            42 | 54 => XKB_MOD_SHIFT,
+            29 | 97 => XKB_MOD_CONTROL,
+            56 | 100 => XKB_MOD_ALT,
+            125 | 126 => XKB_MOD_LOGO,
+            _ => 0,
+        };
+    }
+    mods
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for InjectorState {
@@ -855,3 +1003,50 @@ delegate_noop!(InjectorState: ignore ZwlrVirtualPointerV1);
 delegate_noop!(InjectorState: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(InjectorState: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(InjectorState: ignore wl_buffer::WlBuffer);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_bytes(kind: u16, value: i32) -> Vec<u8> {
+        let event = LinuxInputEvent {
+            _time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            kind,
+            _code: 30,
+            value,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&event as *const LinuxInputEvent).cast::<u8>(),
+                size_of::<LinuxInputEvent>(),
+            )
+        };
+        bytes.to_vec()
+    }
+
+    #[test]
+    fn physical_keyboard_event_triggers_takeover() {
+        assert!(has_physical_input(&event_bytes(EV_KEY, 1)));
+    }
+
+    #[test]
+    fn sync_and_release_events_do_not_trigger_takeover() {
+        assert!(!has_physical_input(&event_bytes(0, 0)));
+        assert!(!has_physical_input(&event_bytes(EV_KEY, 0)));
+    }
+
+    #[test]
+    fn modifier_keys_map_to_xkb_masks() {
+        let held_keys = HashSet::from([125, 2]);
+        assert_eq!(modifiers(&held_keys), XKB_MOD_LOGO);
+
+        let held_keys = HashSet::from([42, 29, 56]);
+        assert_eq!(
+            modifiers(&held_keys),
+            XKB_MOD_SHIFT | XKB_MOD_CONTROL | XKB_MOD_ALT
+        );
+    }
+}

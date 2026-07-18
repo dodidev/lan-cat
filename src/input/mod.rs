@@ -18,6 +18,8 @@ use transport::{Inbound, Outbound};
 
 const CONFIRM_TIME: Duration = Duration::from_secs(3);
 const PRESS_GAP: Duration = Duration::from_millis(280);
+const TAKEOVER_REPEAT_TIME: Duration = Duration::from_millis(700);
+const TAKEOVER_REPEAT_GAP: Duration = Duration::from_millis(70);
 
 enum Outgoing {
     Probing {
@@ -72,6 +74,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
     let mut outgoing: Option<Outgoing> = None;
     let mut incoming: Option<Incoming> = None;
     let mut preview: Option<Preview> = None;
+    let mut takeover: Option<(String, Instant, Instant)> = None;
     let mut confirmed_peers = HashSet::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -142,6 +145,14 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             send(&outbound, peer.clone(), InputMessage::Keyboard(keyboard))?;
                         }
                     }
+                    CaptureEvent::LocalInput => {
+                        if let Some(active) = incoming.take() {
+                            injector.end()?;
+                            capture.release();
+                            takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
+                            send_takeover(&outbound, active.peer)?;
+                        }
+                    }
                 }
             }
             event = inbound.recv() => {
@@ -192,6 +203,12 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         }
                     }
                     InputMessage::Enter { edge, position } => {
+                        if takeover.as_ref().is_some_and(|(active, started, _)| {
+                            *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME
+                        }) {
+                            send_takeover(&outbound, peer)?;
+                            continue;
+                        }
                         let preview_matches = preview.as_ref().is_some_and(|value| {
                             value.peer == peer
                                 && value.edge == edge
@@ -235,12 +252,22 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         }
                     }
                     InputMessage::Pointer(pointer) => {
-                        if incoming.as_ref().is_some_and(|value| value.peer == peer) {
+                        let takeover_active = takeover.as_ref().is_some_and(|(active, started, _)| {
+                            *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME
+                        });
+                        if takeover_active {
+                            send_takeover(&outbound, peer)?;
+                        } else if incoming.as_ref().is_some_and(|value| value.peer == peer) {
                             injector.apply(pointer)?;
                         }
                     }
                     InputMessage::Keyboard(keyboard) => {
-                        if incoming.as_ref().is_some_and(|value| value.peer == peer) {
+                        let takeover_active = takeover.as_ref().is_some_and(|(active, started, _)| {
+                            *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME
+                        });
+                        if takeover_active {
+                            send_takeover(&outbound, peer)?;
+                        } else if incoming.as_ref().is_some_and(|value| value.peer == peer) {
                             injector.apply_keyboard(keyboard)?;
                         }
                     }
@@ -255,6 +282,14 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         send(&outbound, peer.clone(), InputMessage::Ping)?;
                     }
                     last_ping = now;
+                }
+                if let Some((peer, started, last_sent)) = &mut takeover {
+                    if started.elapsed() > TAKEOVER_REPEAT_TIME {
+                        takeover = None;
+                    } else if last_sent.elapsed() >= TAKEOVER_REPEAT_GAP {
+                        send_takeover(&outbound, peer.clone())?;
+                        *last_sent = Instant::now();
+                    }
                 }
                 let mut confirm = None;
                 let mut cancel = None;
@@ -343,6 +378,14 @@ fn send_probe(
             progress,
         },
     )
+}
+
+fn send_takeover(
+    sender: &tokio::sync::mpsc::UnboundedSender<Outbound>,
+    peer: String,
+) -> Result<()> {
+    send(sender, peer.clone(), InputMessage::Leave)?;
+    send(sender, peer, InputMessage::Cancel)
 }
 
 fn outgoing_peer(value: &Outgoing) -> &str {

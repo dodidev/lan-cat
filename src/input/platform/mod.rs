@@ -15,4 +15,5 @@ pub enum CaptureEvent {
     Begin { edge: Edge, position: f64 },
     Pointer(PointerInput),
     Keyboard(KeyboardInput),
+    LocalInput,
 }
