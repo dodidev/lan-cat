@@ -21,6 +21,7 @@ const PRESS_GAP: Duration = Duration::from_millis(280);
 const PEER_TIMEOUT: Duration = Duration::from_millis(1_200);
 const TAKEOVER_REPEAT_TIME: Duration = Duration::from_millis(700);
 const TAKEOVER_REPEAT_GAP: Duration = Duration::from_millis(70);
+const REMOTE_ENTRY_INSET: f64 = 3.0;
 #[cfg(debug_assertions)]
 const DEBUG_ESC_KILL_TIME: Duration = Duration::from_secs(3);
 #[cfg(debug_assertions)]
@@ -38,6 +39,7 @@ enum Outgoing {
     Sending {
         peer: String,
         edge: Edge,
+        depth: f64,
         ready: bool,
     },
 }
@@ -121,6 +123,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             outgoing = Some(Outgoing::Sending {
                                 peer,
                                 edge,
+                                depth: REMOTE_ENTRY_INSET,
                                 ready: false,
                             });
                             continue;
@@ -151,8 +154,8 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                                 }
                             }
                         }
-                        Some(Outgoing::Sending { peer, edge, ready }) => {
-                            if is_return_motion(*edge, pointer) {
+                        Some(Outgoing::Sending { peer, edge, depth, ready }) => {
+                            if *ready && crosses_host_edge(*edge, pointer, depth) {
                                 send_force_leave(&outbound, peer.clone())?;
                                 outgoing = None;
                                 capture.release();
@@ -357,6 +360,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     outgoing = Some(Outgoing::Sending {
                         peer,
                         edge,
+                        depth: REMOTE_ENTRY_INSET,
                         ready: false,
                     });
                 }
@@ -440,8 +444,12 @@ fn pressure(edge: Edge, pointer: protocol::PointerInput) -> Option<(f64, f64)> {
     })
 }
 
-fn is_return_motion(edge: Edge, pointer: protocol::PointerInput) -> bool {
-    pressure(edge, pointer).is_some_and(|(outward, _)| outward < -1.5)
+fn crosses_host_edge(edge: Edge, pointer: protocol::PointerInput, depth: &mut f64) -> bool {
+    let Some((outward, _)) = pressure(edge, pointer) else {
+        return false;
+    };
+    *depth += outward;
+    *depth <= 0.0
 }
 
 fn send_probe(
@@ -510,22 +518,39 @@ mod tests {
     }
 
     #[test]
-    fn reverse_motion_returns_cursor_to_host() {
-        assert!(is_return_motion(
+    fn cursor_returns_only_after_crossing_original_edge() {
+        let mut depth = REMOTE_ENTRY_INSET;
+        assert!(!crosses_host_edge(
             Edge::Right,
-            PointerInput::Motion { dx: -2.0, dy: 0.0 }
+            PointerInput::Motion { dx: 20.0, dy: 0.0 },
+            &mut depth,
         ));
-        assert!(!is_return_motion(
+        assert_eq!(depth, 23.0);
+        assert!(!crosses_host_edge(
             Edge::Right,
-            PointerInput::Motion { dx: 2.0, dy: 0.0 }
+            PointerInput::Motion { dx: -10.0, dy: 0.0 },
+            &mut depth,
         ));
-        assert!(!is_return_motion(
+        assert_eq!(depth, 13.0);
+        assert!(crosses_host_edge(
+            Edge::Right,
+            PointerInput::Motion { dx: -14.0, dy: 0.0 },
+            &mut depth,
+        ));
+    }
+
+    #[test]
+    fn non_motion_does_not_change_remote_depth() {
+        let mut depth = REMOTE_ENTRY_INSET;
+        assert!(!crosses_host_edge(
             Edge::Right,
             PointerInput::Button {
                 button: 0x110,
-                state: 1,
-            }
+                state: 1
+            },
+            &mut depth,
         ));
+        assert_eq!(depth, REMOTE_ENTRY_INSET);
     }
 
     #[test]
