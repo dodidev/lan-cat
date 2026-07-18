@@ -179,6 +179,12 @@ impl Capture {
     }
 }
 
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 fn capture_thread(state: *const Mutex<State>, startup: std::sync::mpsc::SyncSender<Result<()>>) {
     let mask = [
         LEFT_DOWN,
@@ -275,6 +281,17 @@ unsafe extern "C" fn callback(
     }
     if !state.active && !synthetic && is_local_input(event_type) {
         let _ = state.events.send(CaptureEvent::LocalInput);
+        if matches!(event_type, KEY_DOWN | KEY_UP) {
+            let mac_key = unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) } as u16;
+            if let Some(key) = mac_to_evdev(mac_key) {
+                let _ = state
+                    .events
+                    .send(CaptureEvent::LocalKeyboard(KeyboardInput {
+                        key,
+                        state: u32::from(event_type == KEY_DOWN),
+                    }));
+            }
+        }
     }
     if !state.active {
         return event;
@@ -439,6 +456,12 @@ impl Injector {
             post_key(input.key, true)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for Injector {
+    fn drop(&mut self) {
+        let _ = self.end();
     }
 }
 

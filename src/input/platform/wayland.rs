@@ -76,7 +76,7 @@ const XKB_MOD_LOGO: u32 = 1 << 6;
 struct LinuxInputEvent {
     _time: libc::timeval,
     kind: u16,
-    _code: u16,
+    code: u16,
     value: i32,
 }
 
@@ -113,6 +113,12 @@ impl Capture {
 
     pub fn release(&self) {
         self.active.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -221,6 +227,12 @@ fn physical_inputs(buffer: &[u8]) -> Vec<CaptureEvent> {
         let event = unsafe { chunk.as_ptr().cast::<LinuxInputEvent>().read_unaligned() };
         if matches!(event.kind, EV_KEY | EV_REL | EV_ABS) && event.value != 0 {
             events.push(CaptureEvent::LocalInput);
+        }
+        if event.kind == EV_KEY && matches!(event.value, 0 | 1) {
+            events.push(CaptureEvent::LocalKeyboard(KeyboardInput {
+                key: u32::from(event.code),
+                state: event.value as u32,
+            }));
         }
     }
     events
@@ -947,6 +959,12 @@ impl Injector {
     }
 }
 
+impl Drop for Injector {
+    fn drop(&mut self) {
+        let _ = self.end();
+    }
+}
+
 fn wayland_axis(axis: u8) -> Result<wl_pointer::Axis> {
     match axis {
         0 => Ok(wl_pointer::Axis::VerticalScroll),
@@ -1023,7 +1041,7 @@ mod tests {
                 tv_usec: 0,
             },
             kind,
-            _code: 1,
+            code: 1,
             value,
         };
         let bytes = unsafe {
@@ -1059,12 +1077,18 @@ mod tests {
     }
 
     #[test]
-    fn physical_keyboard_events_include_takeover_signal() {
+    fn physical_keyboard_events_include_takeover_and_key_state() {
         let events = physical_inputs(&event_bytes(EV_KEY, 1));
         assert!(
             events
                 .iter()
                 .any(|event| matches!(event, CaptureEvent::LocalInput))
         );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                CaptureEvent::LocalKeyboard(KeyboardInput { key: 1, state: 1 })
+            )
+        }));
     }
 }

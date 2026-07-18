@@ -16,4 +16,5 @@ pub enum CaptureEvent {
     Pointer(PointerInput),
     Keyboard(KeyboardInput),
     LocalInput,
+    LocalKeyboard(KeyboardInput),
 }

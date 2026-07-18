@@ -90,7 +90,11 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
     loop {
         tokio::select! {
             event = capture.events.recv() => {
-                let Some(event) = event else { anyhow::bail!("cursor capture stopped") };
+                let Some(event) = event else {
+                    injector.end()?;
+                    capture.release();
+                    anyhow::bail!("cursor capture stopped")
+                };
                 match event {
                     CaptureEvent::Begin { edge, position } => {
                         if incoming.as_ref().is_some_and(|active| active.edge == edge) {
@@ -149,9 +153,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     },
                     CaptureEvent::Keyboard(keyboard) => {
                         #[cfg(debug_assertions)]
-                        if matches!(outgoing, Some(Outgoing::Sending { ready: true, .. })) {
-                            update_debug_escape_kill(keyboard, &mut escape_started);
-                        }
+                        update_debug_escape_kill(keyboard, &mut escape_started);
                         if let Some(Outgoing::Sending { peer, ready: true }) = &outgoing {
                             send(&outbound, peer.clone(), InputMessage::Keyboard(keyboard))?;
                         }
@@ -165,10 +167,18 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             send_takeover(&outbound, active.peer)?;
                         }
                     }
+                    CaptureEvent::LocalKeyboard(keyboard) => {
+                        #[cfg(debug_assertions)]
+                        update_debug_escape_kill(keyboard, &mut escape_started);
+                    }
                 }
             }
             event = inbound.recv() => {
-                let Some(Inbound { peer, message }) = event else { anyhow::bail!("cursor transport stopped") };
+                let Some(Inbound { peer, message }) = event else {
+                    injector.end()?;
+                    capture.release();
+                    anyhow::bail!("cursor transport stopped")
+                };
                     message.validate()?;
                     last_seen.insert(peer.clone(), Instant::now());
                     match message {
@@ -274,6 +284,8 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         }
                     }
                     InputMessage::Keyboard(keyboard) => {
+                        #[cfg(debug_assertions)]
+                        update_debug_escape_kill(keyboard, &mut escape_started);
                         let takeover_active = takeover.as_ref().is_some_and(|(active, started, _)| {
                             *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME
                         });
