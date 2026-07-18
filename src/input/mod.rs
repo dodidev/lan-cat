@@ -140,7 +140,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                                     let progress = (started.elapsed().as_secs_f32() / CONFIRM_TIME.as_secs_f32()).min(1.0);
                                     send_probe(&outbound, peer.clone(), *edge, *position, progress)?;
                                 } else if outward < -1.5 {
-                                    send(&outbound, peer.clone(), InputMessage::Cancel)?;
+                                    send_force_leave(&outbound, peer.clone())?;
                                     outgoing = None;
                                     capture.release();
                                 }
@@ -164,7 +164,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             capture.release();
                             confirmed_peers.remove(&active.peer);
                             takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
-                            send_takeover(&outbound, active.peer)?;
+                            send_force_leave(&outbound, active.peer)?;
                         }
                     }
                     CaptureEvent::LocalKeyboard(keyboard) => {
@@ -184,7 +184,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     match message {
                         InputMessage::Probe { edge, position, progress } => {
                             if incoming.is_some() {
-                                send(&outbound, peer, InputMessage::Cancel)?;
+                                send_force_leave(&outbound, peer)?;
                                 continue;
                             }
                             // Confirmed peers may enter directly; do not replay the portal UI.
@@ -215,20 +215,11 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             if *active == peer { *acknowledged = true; }
                         }
                     }
-                    InputMessage::Cancel => {
-                        if outgoing.as_ref().is_some_and(|value| outgoing_peer(value) == peer) {
-                            outgoing = None;
-                            capture.release();
-                        }
-                        if preview.as_ref().is_some_and(|value| value.peer == peer) {
-                            if let Some(mut value) = preview.take() { value.beacon.cancel(); }
-                        }
-                    }
                     InputMessage::Enter { edge, position } => {
                         if takeover.as_ref().is_some_and(|(active, started, _)| {
                             *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME
                         }) {
-                            send_takeover(&outbound, peer)?;
+                            send_force_leave(&outbound, peer)?;
                             continue;
                         }
                         let preview_matches = preview.as_ref().is_some_and(|value| {
@@ -242,7 +233,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             || incoming.is_some()
                             || outgoing_wins
                         {
-                            send(&outbound, peer, InputMessage::Cancel)?;
+                            send_force_leave(&outbound, peer)?;
                             continue;
                         }
                         if let Some(mut value) = preview.take() { value.beacon.confirm(); }
@@ -278,7 +269,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME
                         });
                         if takeover_active {
-                            send_takeover(&outbound, peer)?;
+                            send_force_leave(&outbound, peer)?;
                         } else if incoming.as_ref().is_some_and(|value| value.peer == peer) {
                             injector.apply(pointer)?;
                         }
@@ -290,7 +281,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME
                         });
                         if takeover_active {
-                            send_takeover(&outbound, peer)?;
+                            send_force_leave(&outbound, peer)?;
                         } else if incoming.as_ref().is_some_and(|value| value.peer == peer) {
                             injector.apply_keyboard(keyboard)?;
                         }
@@ -316,7 +307,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     if started.elapsed() > TAKEOVER_REPEAT_TIME {
                         takeover = None;
                     } else if last_sent.elapsed() >= TAKEOVER_REPEAT_GAP {
-                        send_takeover(&outbound, peer.clone())?;
+                        send_force_leave(&outbound, peer.clone())?;
                         *last_sent = Instant::now();
                     }
                 }
@@ -330,7 +321,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     }
                 }
                 if let Some(peer) = cancel {
-                    send(&outbound, peer, InputMessage::Cancel)?;
+                    send_force_leave(&outbound, peer)?;
                     outgoing = None;
                     capture.release();
                 }
@@ -349,14 +340,14 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         confirmed_peers.remove(&peer);
                         capture.release();
                         takeover = Some((peer.clone(), Instant::now(), Instant::now()));
-                        send_takeover(&outbound, peer)?;
+                        send_force_leave(&outbound, peer)?;
                     }
                 }
                 if incoming.as_ref().is_some_and(|value| peer_timed_out(&last_seen, &value.peer)) {
                     if let Some(active) = incoming.take() {
                         confirmed_peers.remove(&active.peer);
                         takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
-                        send_takeover(&outbound, active.peer)?;
+                        send_force_leave(&outbound, active.peer)?;
                     }
                     injector.end()?;
                 }
@@ -436,7 +427,7 @@ fn send_probe(
     )
 }
 
-fn send_takeover(
+fn send_force_leave(
     sender: &tokio::sync::mpsc::UnboundedSender<Outbound>,
     peer: String,
 ) -> Result<()> {

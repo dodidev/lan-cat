@@ -87,7 +87,6 @@ pub enum InputMessage {
         progress: f32,
     },
     ProbeAck,
-    Cancel,
     Enter {
         edge: Edge,
         position: f64,

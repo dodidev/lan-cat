@@ -107,19 +107,31 @@ async fn run(
     loop {
         tokio::select! {
             event = browse.recv_async() => {
-                if let ServiceEvent::ServiceResolved(info) = event? {
-                    let Some((peer, addr)) = resolved_peer(&info) else { continue };
-                    if peer == local_id || !is_cursor_peer(&cfg, &peer) { continue; }
-                    addresses.insert(peer.clone(), addr);
-                    send_hello(
-                        &socket, &cfg, &local_id, &peer, addr,
-                        ephemeral_public, local_nonce,
-                        false,
-                    ).await?;
+                match event {
+                    Ok(ServiceEvent::ServiceResolved(info)) => {
+                        let Some((peer, addr)) = resolved_peer(&info) else { continue };
+                        if peer == local_id || !is_cursor_peer(&cfg, &peer) { continue; }
+                        addresses.insert(peer.clone(), addr);
+                        if let Err(error) = send_hello(
+                            &socket, &cfg, &local_id, &peer, addr,
+                            ephemeral_public, local_nonce,
+                            false,
+                        ).await {
+                            tracing::debug!(%peer, %addr, %error, "cursor hello send failed");
+                            addresses.remove(&peer);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "cursor mDNS browse event failed");
+                    }
                 }
             },
             received = socket.recv_from(&mut buffer) => {
-                let (len, addr) = received?;
+                let Ok((len, addr)) = received else {
+                    tracing::debug!(error = %received.expect_err("recv error"), "cursor UDP receive failed");
+                    continue;
+                };
                 if let Err(error) = receive_datagram(
                     &socket,
                     &cfg,
@@ -139,23 +151,34 @@ async fn run(
             message = outbound.recv() => {
                 let Some(message) = message else { break };
                 if let Some(session) = sessions.get_mut(&message.peer) {
-                    send_data(&socket, &local_id, session, message.message).await?;
+                    if let Err(error) = send_data(&socket, &local_id, session, message.message).await {
+                        tracing::debug!(peer = %message.peer, %error, "cursor data send failed");
+                        sessions.remove(&message.peer);
+                        addresses.remove(&message.peer);
+                    }
                 } else if let Some(&addr) = addresses.get(&message.peer) {
-                    send_hello(
+                    if let Err(error) = send_hello(
                         &socket, &cfg, &local_id, &message.peer, addr,
                         ephemeral_public, local_nonce,
                         false,
-                    ).await?;
+                    ).await {
+                        tracing::debug!(peer = %message.peer, %addr, %error, "cursor hello send failed");
+                        addresses.remove(&message.peer);
+                    }
                 }
             }
             _ = hello_tick.tick() => {
-                for (peer, &addr) in &addresses {
-                    if !sessions.contains_key(peer) {
-                        send_hello(
-                            &socket, &cfg, &local_id, peer, addr,
+                let peers: Vec<_> = addresses.iter().map(|(peer, &addr)| (peer.clone(), addr)).collect();
+                for (peer, addr) in peers {
+                    if !sessions.contains_key(&peer) {
+                        if let Err(error) = send_hello(
+                            &socket, &cfg, &local_id, &peer, addr,
                             ephemeral_public, local_nonce,
                             false,
-                        ).await?;
+                        ).await {
+                            tracing::debug!(%peer, %addr, %error, "cursor hello send failed");
+                            addresses.remove(&peer);
+                        }
                     }
                 }
             }
