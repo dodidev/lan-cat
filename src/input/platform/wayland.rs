@@ -178,8 +178,8 @@ fn run_local_input_monitor(events: mpsc::UnboundedSender<CaptureEvent>) -> Resul
                 }
                 continue;
             }
-            if has_physical_input(&buffer[..bytes as usize]) {
-                let _ = events.send(CaptureEvent::LocalInput);
+            for event in physical_inputs(&buffer[..bytes as usize]) {
+                let _ = events.send(event);
             }
         }
 
@@ -215,14 +215,22 @@ fn open_input_devices(path: impl AsRef<Path>) -> Result<Vec<File>> {
     Ok(devices)
 }
 
-fn has_physical_input(buffer: &[u8]) -> bool {
+fn physical_inputs(buffer: &[u8]) -> Vec<CaptureEvent> {
+    let mut events = Vec::new();
     for chunk in buffer.chunks_exact(size_of::<LinuxInputEvent>()) {
         let event = unsafe { chunk.as_ptr().cast::<LinuxInputEvent>().read_unaligned() };
         if matches!(event.kind, EV_KEY | EV_REL | EV_ABS) && event.value != 0 {
-            return true;
+            events.push(CaptureEvent::LocalInput);
         }
     }
-    false
+    events
+}
+
+#[cfg(test)]
+fn has_physical_input(buffer: &[u8]) -> bool {
+    physical_inputs(buffer)
+        .iter()
+        .any(|event| matches!(event, CaptureEvent::LocalInput))
 }
 
 struct EdgeLayer {
@@ -1015,7 +1023,7 @@ mod tests {
                 tv_usec: 0,
             },
             kind,
-            _code: 30,
+            _code: 1,
             value,
         };
         let bytes = unsafe {
@@ -1047,6 +1055,16 @@ mod tests {
         assert_eq!(
             modifiers(&held_keys),
             XKB_MOD_SHIFT | XKB_MOD_CONTROL | XKB_MOD_ALT
+        );
+    }
+
+    #[test]
+    fn physical_keyboard_events_include_takeover_signal() {
+        let events = physical_inputs(&event_bytes(EV_KEY, 1));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CaptureEvent::LocalInput))
         );
     }
 }

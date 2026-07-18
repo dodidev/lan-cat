@@ -18,8 +18,13 @@ use transport::{Inbound, Outbound};
 
 const CONFIRM_TIME: Duration = Duration::from_secs(3);
 const PRESS_GAP: Duration = Duration::from_millis(280);
+const PEER_TIMEOUT: Duration = Duration::from_millis(1_200);
 const TAKEOVER_REPEAT_TIME: Duration = Duration::from_millis(700);
 const TAKEOVER_REPEAT_GAP: Duration = Duration::from_millis(70);
+#[cfg(debug_assertions)]
+const DEBUG_ESC_KILL_TIME: Duration = Duration::from_secs(3);
+#[cfg(debug_assertions)]
+const ESC_KEY: u32 = 1;
 
 enum Outgoing {
     Probing {
@@ -79,6 +84,8 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut last_ping = Instant::now() - Duration::from_secs(1);
+    #[cfg(debug_assertions)]
+    let mut escape_started: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -141,6 +148,10 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         _ => {}
                     },
                     CaptureEvent::Keyboard(keyboard) => {
+                        #[cfg(debug_assertions)]
+                        if matches!(outgoing, Some(Outgoing::Sending { ready: true, .. })) {
+                            update_debug_escape_kill(keyboard, &mut escape_started);
+                        }
                         if let Some(Outgoing::Sending { peer, ready: true }) = &outgoing {
                             send(&outbound, peer.clone(), InputMessage::Keyboard(keyboard))?;
                         }
@@ -283,6 +294,11 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     }
                     last_ping = now;
                 }
+                #[cfg(debug_assertions)]
+                if escape_started.is_some_and(|started| started.elapsed() >= DEBUG_ESC_KILL_TIME) {
+                    tracing::warn!("debug escape kill switch triggered");
+                    std::process::exit(0);
+                }
                 if let Some((peer, started, last_sent)) = &mut takeover {
                     if started.elapsed() > TAKEOVER_REPEAT_TIME {
                         takeover = None;
@@ -314,20 +330,45 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                 }
                 if let Some(value) = outgoing.as_ref() {
                     let peer = outgoing_peer(value);
-                    if last_seen.get(peer).is_none_or(|seen| seen.elapsed() > Duration::from_secs(2)) {
+                    if peer_timed_out(&last_seen, peer) {
+                        let peer = peer.to_owned();
                         outgoing = None;
+                        confirmed_peers.remove(&peer);
                         capture.release();
+                        takeover = Some((peer.clone(), Instant::now(), Instant::now()));
+                        send_takeover(&outbound, peer)?;
                     }
                 }
-                if incoming.as_ref().is_some_and(|value| {
-                    last_seen.get(&value.peer).is_none_or(|seen| seen.elapsed() > Duration::from_secs(2))
-                }) {
+                if incoming.as_ref().is_some_and(|value| peer_timed_out(&last_seen, &value.peer)) {
+                    if let Some(active) = incoming.take() {
+                        confirmed_peers.remove(&active.peer);
+                    }
                     injector.end()?;
-                    incoming = None;
                 }
             }
         }
     }
+}
+
+#[cfg(debug_assertions)]
+fn update_debug_escape_kill(
+    keyboard: protocol::KeyboardInput,
+    escape_started: &mut Option<Instant>,
+) {
+    if keyboard.key != ESC_KEY {
+        return;
+    }
+    if keyboard.state == 0 {
+        *escape_started = None;
+    } else if escape_started.is_none() {
+        *escape_started = Some(Instant::now());
+    }
+}
+
+fn peer_timed_out(last_seen: &HashMap<String, Instant>, peer: &str) -> bool {
+    last_seen
+        .get(peer)
+        .is_none_or(|seen| seen.elapsed() > PEER_TIMEOUT)
 }
 
 fn select_peer(cfg: &Config, online: &HashMap<String, Instant>, position: f64) -> Option<String> {
@@ -426,5 +467,20 @@ mod tests {
             pressure(Edge::Bottom, PointerInput::Motion { dx: 20.0, dy: 4.0 }),
             Some((4.0, 0.02))
         );
+    }
+
+    #[test]
+    fn peer_timeout_requires_recent_packet() {
+        let mut seen = HashMap::new();
+        assert!(peer_timed_out(&seen, "peer"));
+
+        seen.insert("peer".to_owned(), Instant::now());
+        assert!(!peer_timed_out(&seen, "peer"));
+
+        seen.insert(
+            "peer".to_owned(),
+            Instant::now() - PEER_TIMEOUT - Duration::from_millis(1),
+        );
+        assert!(peer_timed_out(&seen, "peer"));
     }
 }

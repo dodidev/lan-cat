@@ -1,7 +1,10 @@
 use std::{
     ffi::{c_double, c_int, c_long, c_void},
     ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, bail};
@@ -59,14 +62,18 @@ const FIELD_DELTA_Y: u32 = 5;
 const FIELD_KEYCODE: u32 = 9;
 const FIELD_SCROLL_Y: u32 = 11;
 const FIELD_SCROLL_X: u32 = 12;
+const FIELD_SOURCE_USER_DATA: u32 = 42;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
+const SYNTHETIC_EVENT_TAG: c_long = 0x6c616e636174;
 const FLAG_CAPS_LOCK: u64 = 1 << 16;
 const FLAG_SHIFT: u64 = 1 << 17;
 const FLAG_CONTROL: u64 = 1 << 18;
 const FLAG_OPTION: u64 = 1 << 19;
 const FLAG_COMMAND: u64 = 1 << 20;
+
+static REMOTE_INJECTING: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -80,6 +87,7 @@ unsafe extern "C" {
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> c_long;
+    fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: c_long);
     fn CGEventGetFlags(event: CGEventRef) -> u64;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventCreateMouseEvent(
@@ -245,6 +253,11 @@ unsafe extern "C" fn callback(
     let Ok(mut state) = state.lock() else {
         return event;
     };
+    let synthetic = unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_USER_DATA) }
+        == SYNTHETIC_EVENT_TAG;
+    if synthetic && !REMOTE_INJECTING.load(Ordering::Acquire) {
+        return event;
+    }
     if !state.active && is_motion(event_type) {
         let point = unsafe { CGEventGetLocation(event) };
         let dx = unsafe { CGEventGetIntegerValueField(event, FIELD_DELTA_X) } as f64;
@@ -259,6 +272,9 @@ unsafe extern "C" fn callback(
             let _ = state.events.send(CaptureEvent::Begin { edge, position });
             return ptr::null_mut();
         }
+    }
+    if !state.active && !synthetic && is_local_input(event_type) {
+        let _ = state.events.send(CaptureEvent::LocalInput);
     }
     if !state.active {
         return event;
@@ -348,11 +364,16 @@ impl Injector {
     }
 
     pub fn begin(&mut self, edge: Edge, position: f64) -> Result<()> {
+        REMOTE_INJECTING.store(true, Ordering::Release);
         self.point = edge_point(edge, position, 3.0);
         unsafe {
             CGWarpMouseCursorPosition(self.point);
         }
-        post_mouse(MOUSE_MOVED, self.point, 0)
+        let result = post_mouse(MOUSE_MOVED, self.point, 0);
+        if result.is_err() {
+            REMOTE_INJECTING.store(false, Ordering::Release);
+        }
+        result
     }
 
     pub fn apply(&mut self, input: PointerInput) -> Result<()> {
@@ -372,7 +393,7 @@ impl Injector {
                 } else {
                     MOUSE_MOVED
                 };
-                post_mouse(event_type, self.point, 0)?;
+                post_mouse_with_delta(event_type, self.point, 0, dx, dy)?;
             }
             PointerInput::Button { button, state } => {
                 let (bit, down, up, number) = match button {
@@ -405,6 +426,7 @@ impl Injector {
         for key in std::mem::take(&mut self.held_keys) {
             post_key(key, false)?;
         }
+        REMOTE_INJECTING.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -466,6 +488,26 @@ fn is_motion(event: u32) -> bool {
     matches!(
         event,
         MOUSE_MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED
+    )
+}
+
+fn is_local_input(event: u32) -> bool {
+    matches!(
+        event,
+        LEFT_DOWN
+            | LEFT_UP
+            | RIGHT_DOWN
+            | RIGHT_UP
+            | MOUSE_MOVED
+            | LEFT_DRAGGED
+            | RIGHT_DRAGGED
+            | KEY_DOWN
+            | KEY_UP
+            | FLAGS_CHANGED
+            | SCROLL_WHEEL
+            | OTHER_DOWN
+            | OTHER_UP
+            | OTHER_DRAGGED
     )
 }
 
@@ -626,15 +668,40 @@ fn evdev_to_mac(key: u32) -> Option<u16> {
 }
 
 fn post_mouse(event_type: u32, point: CGPoint, button: u32) -> Result<()> {
+    post_mouse_with_delta(event_type, point, button, 0.0, 0.0)
+}
+
+fn post_mouse_with_delta(
+    event_type: u32,
+    point: CGPoint,
+    button: u32,
+    dx: f64,
+    dy: f64,
+) -> Result<()> {
     let event = unsafe { CGEventCreateMouseEvent(ptr::null(), event_type, point, button) };
     if event.is_null() {
         bail!("cannot create macOS mouse event");
     }
     unsafe {
+        CGEventSetIntegerValueField(event, FIELD_SOURCE_USER_DATA, SYNTHETIC_EVENT_TAG);
+        if is_motion(event_type) {
+            CGEventSetIntegerValueField(event, FIELD_DELTA_X, delta_field(dx));
+            CGEventSetIntegerValueField(event, FIELD_DELTA_Y, delta_field(dy));
+        }
         CGEventPost(0, event);
         CFRelease(event);
     }
     Ok(())
+}
+
+fn delta_field(value: f64) -> c_long {
+    if value > 0.0 {
+        value.max(1.0) as c_long
+    } else if value < 0.0 {
+        value.min(-1.0) as c_long
+    } else {
+        0
+    }
 }
 
 fn post_scroll(axis: u8, value: f64) -> Result<()> {
@@ -648,6 +715,7 @@ fn post_scroll(axis: u8, value: f64) -> Result<()> {
         bail!("cannot create macOS scroll event");
     }
     unsafe {
+        CGEventSetIntegerValueField(event, FIELD_SOURCE_USER_DATA, SYNTHETIC_EVENT_TAG);
         CGEventPost(0, event);
         CFRelease(event);
     }
@@ -663,6 +731,7 @@ fn post_key(key: u32, down: bool) -> Result<()> {
         bail!("cannot create macOS keyboard event");
     }
     unsafe {
+        CGEventSetIntegerValueField(event, FIELD_SOURCE_USER_DATA, SYNTHETIC_EVENT_TAG);
         CGEventPost(0, event);
         CFRelease(event);
     }
@@ -688,5 +757,12 @@ mod tests {
         assert_eq!(modifier_to_evdev(0x3b), Some((29, FLAG_CONTROL)));
         assert_eq!(modifier_to_evdev(0x3d), Some((100, FLAG_OPTION)));
         assert_eq!(modifier_to_evdev(0x36), Some((126, FLAG_COMMAND)));
+    }
+
+    #[test]
+    fn tiny_motion_keeps_delta_direction() {
+        assert_eq!(delta_field(0.2), 1);
+        assert_eq!(delta_field(-0.2), -1);
+        assert_eq!(delta_field(0.0), 0);
     }
 }
