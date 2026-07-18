@@ -221,5 +221,5 @@ lan-cat cursor enable
 lan-cat service start
 ```
 
-Allow multicast DNS (UDP 5353), local TCP traffic, and local UDP cursor traffic in host firewalls.
-Normal sync and cursor ports are dynamically selected.
+Allow multicast DNS (UDP 5353), local TCP traffic, and UDP 4242 cursor traffic in host firewalls.
+Normal sync ports are dynamically selected.

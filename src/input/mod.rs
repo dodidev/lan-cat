@@ -55,7 +55,8 @@ pub fn spawn(cfg: Config, local_id: String) -> Result<()> {
                 .enable_all()
                 .build()
                 .expect("input runtime");
-            runtime.block_on(async move {
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&runtime, async move {
                 if let Err(error) = run(cfg, local_id).await {
                     tracing::error!(%error, "cursor service stopped");
                 }

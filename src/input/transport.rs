@@ -18,6 +18,7 @@ use super::protocol::{InputMessage, PointerInput};
 use crate::config::Config;
 
 const SERVICE: &str = "_lan-cat-input._udp.local.";
+const PORT: u16 = 4242;
 const WIRE_VERSION: u8 = 1;
 const MAX_DATAGRAM: usize = 4096;
 
@@ -67,9 +68,10 @@ pub async fn start(
     mpsc::UnboundedSender<Outbound>,
     mpsc::UnboundedReceiver<Inbound>,
 )> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
-    let port = socket.local_addr()?.port();
-    let mdns = publish(local_id, port)?;
+    let socket = UdpSocket::bind(("0.0.0.0", PORT))
+        .await
+        .context("bind cursor UDP port 4242")?;
+    let mdns = publish(local_id, PORT)?;
     let browse = mdns.browse(SERVICE)?;
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
