@@ -16,7 +16,7 @@ use platform::{Capture, CaptureEvent, Injector};
 use protocol::{Edge, InputMessage};
 use transport::{Inbound, Outbound};
 
-const CONFIRM_TIME: Duration = Duration::from_secs(3);
+const CONFIRM_TIME: Duration = Duration::from_secs(2);
 const PRESS_GAP: Duration = Duration::from_millis(280);
 const PEER_TIMEOUT: Duration = Duration::from_millis(1_200);
 const TAKEOVER_REPEAT_TIME: Duration = Duration::from_millis(700);
@@ -57,6 +57,27 @@ struct Preview {
     beacon: Beacon,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum PortalRole {
+    Undecided,
+    Controller,
+    Target { controller: String },
+}
+
+impl PortalRole {
+    fn allows_outgoing(&self) -> bool {
+        !matches!(self, Self::Target { .. })
+    }
+
+    fn allows_incoming(&self, peer: &str) -> bool {
+        match self {
+            Self::Undecided => true,
+            Self::Controller => false,
+            Self::Target { controller } => controller == peer,
+        }
+    }
+}
+
 pub fn spawn(cfg: Config, local_id: String) -> Result<()> {
     std::thread::Builder::new()
         .name("lan-cat-input".into())
@@ -84,6 +105,8 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
     let mut preview: Option<Preview> = None;
     let mut takeover: Option<(String, Instant, Instant)> = None;
     let mut confirmed_peers = HashSet::new();
+    let mut portal_edges: HashMap<String, Edge> = HashMap::new();
+    let mut portal_role = PortalRole::Undecided;
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut last_ping = Instant::now() - Duration::from_secs(1);
@@ -110,7 +133,17 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         if outgoing.is_some() || incoming.is_some() {
                             continue;
                         }
-                        let Some(peer) = select_peer(&cfg, &last_seen, position) else {
+                        if !portal_role.allows_outgoing() {
+                            capture.release();
+                            continue;
+                        }
+                        let Some(peer) = select_peer(
+                            &cfg,
+                            &last_seen,
+                            &portal_edges,
+                            edge,
+                            position,
+                        ) else {
                             capture.release();
                             continue;
                         };
@@ -176,7 +209,6 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         if let Some(active) = incoming.take() {
                             injector.end()?;
                             capture.release();
-                            confirmed_peers.remove(&active.peer);
                             takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
                             send_force_leave(&outbound, active.peer)?;
                         }
@@ -197,12 +229,17 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     last_seen.insert(peer.clone(), Instant::now());
                     match message {
                         InputMessage::Probe { edge, position, progress } => {
-                            if incoming.is_some() {
+                            if incoming.is_some()
+                                || !portal_role.allows_incoming(&peer)
+                                || !portal_edge_available(&portal_edges, &peer, edge)
+                            {
                                 send_force_leave(&outbound, peer)?;
                                 continue;
                             }
                             // Confirmed peers may enter directly; do not replay the portal UI.
-                            if confirmed_peers.contains(&peer) {
+                            if confirmed_peers.contains(&peer)
+                                && portal_edges.get(&peer) == Some(&edge)
+                            {
                                 send(&outbound, peer, InputMessage::ProbeAck)?;
                                 continue;
                             }
@@ -252,7 +289,11 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                                 && value.last_probe.elapsed() <= PRESS_GAP
                         });
                         let outgoing_wins = outgoing.is_some() && local_id > peer;
-                        if (!preview_matches && !confirmed_peers.contains(&peer))
+                        let confirmed_portal = confirmed_peers.contains(&peer)
+                            && portal_edges.get(&peer) == Some(&edge);
+                        if !portal_role.allows_incoming(&peer)
+                            || !portal_edge_available(&portal_edges, &peer, edge)
+                            || (!preview_matches && !confirmed_portal)
                             || incoming.is_some()
                             || outgoing_wins
                         {
@@ -265,14 +306,29 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             capture.release();
                         }
                         injector.begin(edge, position)?;
+                        if portal_role == PortalRole::Undecided {
+                            portal_role = PortalRole::Target {
+                                controller: peer.clone(),
+                            };
+                        }
+                        portal_edges.entry(peer.clone()).or_insert(edge);
                         confirmed_peers.insert(peer.clone());
                         incoming = Some(Incoming { peer: peer.clone(), edge });
                         send(&outbound, peer, InputMessage::Ack)?;
                     }
                     InputMessage::Ack => {
-                        if let Some(Outgoing::Sending { peer: active, ready, .. }) = &mut outgoing {
+                        if let Some(Outgoing::Sending {
+                            peer: active,
+                            edge,
+                            ready,
+                            ..
+                        }) = &mut outgoing {
                             if *active == peer {
                                 *ready = true;
+                                if portal_role == PortalRole::Undecided {
+                                    portal_role = PortalRole::Controller;
+                                }
+                                portal_edges.entry(peer.clone()).or_insert(*edge);
                                 confirmed_peers.insert(peer);
                             }
                         }
@@ -412,7 +468,13 @@ fn peer_timed_out(last_seen: &HashMap<String, Instant>, peer: &str) -> bool {
         .is_none_or(|seen| seen.elapsed() > PEER_TIMEOUT)
 }
 
-fn select_peer(cfg: &Config, online: &HashMap<String, Instant>, position: f64) -> Option<String> {
+fn select_peer(
+    cfg: &Config,
+    online: &HashMap<String, Instant>,
+    portal_edges: &HashMap<String, Edge>,
+    edge: Edge,
+    position: f64,
+) -> Option<String> {
     let mut peers: Vec<_> = cfg
         .peers
         .keys()
@@ -420,6 +482,7 @@ fn select_peer(cfg: &Config, online: &HashMap<String, Instant>, position: f64) -
             online
                 .get(*peer)
                 .is_some_and(|seen| seen.elapsed() < Duration::from_secs(2))
+                && portal_edge_available(portal_edges, peer, edge)
         })
         .cloned()
         .collect();
@@ -430,6 +493,13 @@ fn select_peer(cfg: &Config, online: &HashMap<String, Instant>, position: f64) -
     let index =
         ((position.clamp(0.0, 0.999_999) * peers.len() as f64) as usize).min(peers.len() - 1);
     peers.get(index).cloned()
+}
+
+fn portal_edge_available(portal_edges: &HashMap<String, Edge>, peer: &str, edge: Edge) -> bool {
+    match portal_edges.get(peer) {
+        Some(remembered) => *remembered == edge,
+        None => !portal_edges.values().any(|remembered| *remembered == edge),
+    }
 }
 
 fn pressure(edge: Edge, pointer: protocol::PointerInput) -> Option<(f64, f64)> {
@@ -551,6 +621,33 @@ mod tests {
             &mut depth,
         ));
         assert_eq!(depth, REMOTE_ENTRY_INSET);
+    }
+
+    #[test]
+    fn portal_binding_accepts_only_remembered_edge() {
+        let portal_edges = HashMap::from([("peer".to_owned(), Edge::Right)]);
+        assert!(portal_edge_available(&portal_edges, "peer", Edge::Right));
+        assert!(!portal_edge_available(&portal_edges, "peer", Edge::Left));
+        assert!(!portal_edge_available(
+            &portal_edges,
+            "new-peer",
+            Edge::Right
+        ));
+        assert!(portal_edge_available(&portal_edges, "new-peer", Edge::Left));
+    }
+
+    #[test]
+    fn target_role_cannot_chain_to_another_machine() {
+        let role = PortalRole::Target {
+            controller: "main".to_owned(),
+        };
+        assert!(!role.allows_outgoing());
+        assert!(role.allows_incoming("main"));
+        assert!(!role.allows_incoming("other"));
+
+        let role = PortalRole::Controller;
+        assert!(role.allows_outgoing());
+        assert!(!role.allows_incoming("other"));
     }
 
     #[test]
