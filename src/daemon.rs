@@ -63,6 +63,9 @@ pub async fn run() -> Result<()> {
     let discovery = network::start_discovery(&id, port)?;
 
     let cfg = Arc::new(RwLock::new(cfg));
+    if cfg.read().await.cursor.enabled {
+        crate::input::spawn(cfg.read().await.clone(), id.clone())?;
+    }
     let active = Arc::new(Mutex::new(HashSet::new()));
     let latest: Arc<RwLock<Option<ClipboardEvent>>> = Arc::new(RwLock::new(None));
     let (bus_tx, _) = broadcast::channel::<BusEvent>(128);

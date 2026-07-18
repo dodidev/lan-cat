@@ -428,6 +428,7 @@ mod tests {
             public_key: hex::encode(key.public),
             paused: false,
             peers: Default::default(),
+            cursor: Default::default(),
             clock: VersionVector::default(),
         }
     }

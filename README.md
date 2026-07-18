@@ -12,6 +12,7 @@ Secure, peer-to-peer clipboard sync and LAN file sharing for macOS and Linux Way
 - Finder Quick Action on macOS and Thunar custom action on Linux for **Share with lan-cat**.
 - Manual-start user service support through `launchctl` on macOS and `systemd --user` on Linux.
 - LAN-only discovery through mDNS, with encrypted authenticated connections between trusted peers.
+- Opt-in macOS and Wayland cursor sharing on all four screen edges, including click, scroll, and drag.
 
 ## Security model
 
@@ -98,6 +99,9 @@ lan-cat unpair <peer-id-or-unique-prefix>
 lan-cat name set-name
 lan-cat share <file> [more-files...]
 lan-cat transfers
+lan-cat cursor enable
+lan-cat cursor disable
+lan-cat cursor status
 lan-cat integration install
 lan-cat integration uninstall
 lan-cat service status
@@ -194,12 +198,28 @@ Remove them with `lan-cat integration uninstall`.
   forks are not.
 - Copied directories are rejected by clipboard sync. Use explicit file sharing after selecting
   regular files.
-- Protocol v4 requires all syncing peers to run an upgraded daemon.
+- Cursor uses a dedicated encrypted UDP service; clipboard and file sync remain on protocol v4 TCP.
+- Stop daemon before enabling cursor discovery. Paired online peers are detected automatically;
+  keep pressing any edge for three seconds to confirm entry on peer's opposite edge. Reversing
+  direction cancels fluid edge preview.
+- macOS requires Accessibility and Input Monitoring permissions. Linux Wayland requires layer-shell,
+  relative-pointer, pointer-constraints, and wlroots virtual-pointer protocols.
+- Cursor sharing controls pointer input and in-app drag operations. Dragging files between Finder
+  instances is not yet supported; use `lan-cat share` for files.
+- Clipboard protocol remains v4. Cursor UDP protocol is independently versioned.
 - Existing clipboard content is captured at startup and replayed to peers during the same daemon run.
 - Latest in-memory event is sent when a peer reconnects during the same daemon run.
 - Pause discards events; resume takes a new baseline and does not replay old content.
 - Concurrent copies converge using version vectors and device-ID tie-breaking.
 - Pair discovery expires after two minutes. Normal discovery remains LAN-local via mDNS.
 
-Allow multicast DNS (UDP 5353) and local TCP traffic in host firewalls. Normal sync ports are
-dynamically selected.
+Enable automatic cursor discovery on both devices:
+
+```sh
+lan-cat service stop
+lan-cat cursor enable
+lan-cat service start
+```
+
+Allow multicast DNS (UDP 5353), local TCP traffic, and local UDP cursor traffic in host firewalls.
+Normal sync and cursor ports are dynamically selected.

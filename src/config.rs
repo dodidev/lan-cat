@@ -13,6 +13,12 @@ pub struct Peer {
     pub public_key: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CursorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub version: u16,
@@ -23,6 +29,9 @@ pub struct Config {
     pub public_key: String,
     pub paused: bool,
     pub peers: BTreeMap<String, Peer>,
+    /// Cursor sharing is opt-in because it permits remote input injection.
+    #[serde(default)]
+    pub cursor: CursorConfig,
     /// Content-free causal metadata. Prevents sequence reuse after restart.
     #[serde(default)]
     pub clock: VersionVector,
@@ -51,6 +60,7 @@ impl Config {
             public_key: hex::encode(key.public),
             paused: false,
             peers: BTreeMap::new(),
+            cursor: CursorConfig::default(),
             clock: VersionVector::default(),
         };
         cfg.save()?;
@@ -159,4 +169,24 @@ fn set_private_file(path: &std::path::Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_defaults_cursor_to_disabled() {
+        let json = serde_json::json!({
+            "version": 1,
+            "name": "test",
+            "private_key": "00".repeat(32),
+            "public_key": "11".repeat(32),
+            "paused": false,
+            "peers": {},
+            "clock": {}
+        });
+        let cfg: Config = serde_json::from_value(json).unwrap();
+        assert!(!cfg.cursor.enabled);
+    }
 }
