@@ -209,10 +209,6 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             outgoing = None;
                             capture.release();
                         }
-                        if incoming.as_ref().is_some_and(|value| value.peer == peer) {
-                            injector.end()?;
-                            incoming = None;
-                        }
                         if preview.as_ref().is_some_and(|value| value.peer == peer) {
                             if let Some(mut value) = preview.take() { value.beacon.cancel(); }
                         }
@@ -346,6 +342,8 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                 if incoming.as_ref().is_some_and(|value| peer_timed_out(&last_seen, &value.peer)) {
                     if let Some(active) = incoming.take() {
                         confirmed_peers.remove(&active.peer);
+                        takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
+                        send_takeover(&outbound, active.peer)?;
                     }
                     injector.end()?;
                 }
@@ -429,7 +427,6 @@ fn send_takeover(
     sender: &tokio::sync::mpsc::UnboundedSender<Outbound>,
     peer: String,
 ) -> Result<()> {
-    send(sender, peer.clone(), InputMessage::Cancel)?;
     send(sender, peer, InputMessage::Leave)
 }
 
