@@ -44,6 +44,9 @@ const RIGHT_UP: u32 = 4;
 const MOUSE_MOVED: u32 = 5;
 const LEFT_DRAGGED: u32 = 6;
 const RIGHT_DRAGGED: u32 = 7;
+const KEY_DOWN: u32 = 10;
+const KEY_UP: u32 = 11;
+const FLAGS_CHANGED: u32 = 12;
 const SCROLL_WHEEL: u32 = 22;
 const OTHER_DOWN: u32 = 25;
 const OTHER_UP: u32 = 26;
@@ -53,11 +56,17 @@ const TAP_DISABLED_USER: u32 = 0xffff_ffff;
 const FIELD_BUTTON_NUMBER: u32 = 3;
 const FIELD_DELTA_X: u32 = 4;
 const FIELD_DELTA_Y: u32 = 5;
+const FIELD_KEYCODE: u32 = 9;
 const FIELD_SCROLL_Y: u32 = 11;
 const FIELD_SCROLL_X: u32 = 12;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
+const FLAG_CAPS_LOCK: u64 = 1 << 16;
+const FLAG_SHIFT: u64 = 1 << 17;
+const FLAG_CONTROL: u64 = 1 << 18;
+const FLAG_OPTION: u64 = 1 << 19;
+const FLAG_COMMAND: u64 = 1 << 20;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -71,6 +80,7 @@ unsafe extern "C" {
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> c_long;
+    fn CGEventGetFlags(event: CGEventRef) -> u64;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventCreateMouseEvent(
         source: *const c_void,
@@ -83,6 +93,11 @@ unsafe extern "C" {
         units: u32,
         wheel_count: u32,
         ...
+    ) -> CGEventRef;
+    fn CGEventCreateKeyboardEvent(
+        source: *const c_void,
+        virtual_key: u16,
+        key_down: bool,
     ) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGWarpMouseCursorPosition(position: CGPoint) -> c_int;
@@ -165,6 +180,9 @@ fn capture_thread(state: *const Mutex<State>, startup: std::sync::mpsc::SyncSend
         MOUSE_MOVED,
         LEFT_DRAGGED,
         RIGHT_DRAGGED,
+        KEY_DOWN,
+        KEY_UP,
+        FLAGS_CHANGED,
         SCROLL_WHEEL,
         OTHER_DOWN,
         OTHER_UP,
@@ -245,6 +263,33 @@ unsafe extern "C" fn callback(
     if !state.active {
         return event;
     }
+    if is_motion(event_type) {
+        let point = edge_point(state.edge, state.position, 1.0);
+        unsafe {
+            CGWarpMouseCursorPosition(point);
+        }
+    }
+    if matches!(event_type, KEY_DOWN | KEY_UP) {
+        let mac_key = unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) } as u16;
+        if let Some(key) = mac_to_evdev(mac_key) {
+            let _ = state.events.send(CaptureEvent::Keyboard(KeyboardInput {
+                key,
+                state: u32::from(event_type == KEY_DOWN),
+            }));
+        }
+        return ptr::null_mut();
+    }
+    if event_type == FLAGS_CHANGED {
+        let mac_key = unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) } as u16;
+        let flags = unsafe { CGEventGetFlags(event) };
+        if let Some((key, mask)) = modifier_to_evdev(mac_key) {
+            let _ = state.events.send(CaptureEvent::Keyboard(KeyboardInput {
+                key,
+                state: u32::from(flags & mask != 0),
+            }));
+        }
+        return ptr::null_mut();
+    }
     let pointer = match event_type {
         MOUSE_MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED => {
             let dx = unsafe { CGEventGetIntegerValueField(event, FIELD_DELTA_X) } as f64;
@@ -290,6 +335,7 @@ unsafe extern "C" fn callback(
 pub struct Injector {
     point: CGPoint,
     buttons: u8,
+    held_keys: Vec<u32>,
 }
 
 impl Injector {
@@ -297,6 +343,7 @@ impl Injector {
         Ok(Self {
             point: edge_point(Edge::Left, 0.5, 3.0),
             buttons: 0,
+            held_keys: Vec::new(),
         })
     }
 
@@ -355,10 +402,20 @@ impl Injector {
                 self.apply(PointerInput::Button { button, state: 0 })?;
             }
         }
+        for key in std::mem::take(&mut self.held_keys) {
+            post_key(key, false)?;
+        }
         Ok(())
     }
 
-    pub fn apply_keyboard(&mut self, _input: KeyboardInput) -> Result<()> {
+    pub fn apply_keyboard(&mut self, input: KeyboardInput) -> Result<()> {
+        if input.state == 0 {
+            self.held_keys.retain(|key| *key != input.key);
+            post_key(input.key, false)?;
+        } else if !self.held_keys.contains(&input.key) {
+            self.held_keys.push(input.key);
+            post_key(input.key, true)?;
+        }
         Ok(())
     }
 }
@@ -412,6 +469,162 @@ fn is_motion(event: u32) -> bool {
     )
 }
 
+fn mac_to_evdev(key: u16) -> Option<u32> {
+    Some(match key {
+        0x00 => 30,  // A
+        0x01 => 31,  // S
+        0x02 => 32,  // D
+        0x03 => 33,  // F
+        0x04 => 35,  // H
+        0x05 => 34,  // G
+        0x06 => 44,  // Z
+        0x07 => 45,  // X
+        0x08 => 46,  // C
+        0x09 => 47,  // V
+        0x0b => 48,  // B
+        0x0c => 16,  // Q
+        0x0d => 17,  // W
+        0x0e => 18,  // E
+        0x0f => 19,  // R
+        0x10 => 21,  // Y
+        0x11 => 20,  // T
+        0x12 => 2,   // 1
+        0x13 => 3,   // 2
+        0x14 => 4,   // 3
+        0x15 => 5,   // 4
+        0x16 => 7,   // 6
+        0x17 => 6,   // 5
+        0x18 => 13,  // =
+        0x19 => 10,  // 9
+        0x1a => 8,   // 7
+        0x1b => 12,  // -
+        0x1c => 9,   // 8
+        0x1d => 11,  // 0
+        0x1e => 27,  // ]
+        0x1f => 24,  // O
+        0x20 => 22,  // U
+        0x21 => 26,  // [
+        0x22 => 23,  // I
+        0x23 => 25,  // P
+        0x24 => 28,  // Enter
+        0x25 => 38,  // L
+        0x26 => 37,  // J
+        0x27 => 40,  // '
+        0x28 => 39,  // ;
+        0x29 => 43,  // `
+        0x2a => 42,  // Left shift
+        0x2b => 51,  // \
+        0x2c => 49,  // /
+        0x2d => 50,  // N
+        0x2e => 36,  // M
+        0x2f => 52,  // .
+        0x30 => 15,  // Tab
+        0x31 => 57,  // Space
+        0x32 => 41,  // `
+        0x33 => 14,  // Backspace
+        0x35 => 1,   // Escape
+        0x36 => 126, // Right command
+        0x37 => 125, // Left command
+        0x38 => 42,  // Left shift
+        0x39 => 58,  // Caps lock
+        0x3a => 56,  // Left option
+        0x3b => 29,  // Left control
+        0x3c => 54,  // Right shift
+        0x3d => 100, // Right option
+        0x3e => 97,  // Right control
+        0x7b => 105, // Left
+        0x7c => 106, // Right
+        0x7d => 108, // Down
+        0x7e => 103, // Up
+        _ => return None,
+    })
+}
+
+fn modifier_to_evdev(key: u16) -> Option<(u32, u64)> {
+    Some(match key {
+        0x36 => (126, FLAG_COMMAND),
+        0x37 => (125, FLAG_COMMAND),
+        0x38 => (42, FLAG_SHIFT),
+        0x39 => (58, FLAG_CAPS_LOCK),
+        0x3a => (56, FLAG_OPTION),
+        0x3b => (29, FLAG_CONTROL),
+        0x3c => (54, FLAG_SHIFT),
+        0x3d => (100, FLAG_OPTION),
+        0x3e => (97, FLAG_CONTROL),
+        _ => return None,
+    })
+}
+
+fn evdev_to_mac(key: u32) -> Option<u16> {
+    Some(match key {
+        1 => 0x35,
+        2 => 0x12,
+        3 => 0x13,
+        4 => 0x14,
+        5 => 0x15,
+        6 => 0x17,
+        7 => 0x16,
+        8 => 0x1a,
+        9 => 0x1c,
+        10 => 0x19,
+        11 => 0x1d,
+        12 => 0x1b,
+        13 => 0x18,
+        14 => 0x33,
+        15 => 0x30,
+        16 => 0x0c,
+        17 => 0x0d,
+        18 => 0x0e,
+        19 => 0x0f,
+        20 => 0x11,
+        21 => 0x10,
+        22 => 0x20,
+        23 => 0x22,
+        24 => 0x1f,
+        25 => 0x23,
+        26 => 0x21,
+        27 => 0x1e,
+        28 => 0x24,
+        29 => 0x3b,
+        30 => 0x00,
+        31 => 0x01,
+        32 => 0x02,
+        33 => 0x03,
+        34 => 0x05,
+        35 => 0x04,
+        36 => 0x2e,
+        37 => 0x26,
+        38 => 0x25,
+        39 => 0x28,
+        40 => 0x27,
+        41 => 0x32,
+        42 => 0x38,
+        43 => 0x2a,
+        44 => 0x06,
+        45 => 0x07,
+        46 => 0x08,
+        47 => 0x09,
+        48 => 0x0b,
+        49 => 0x2d,
+        50 => 0x2c,
+        51 => 0x2b,
+        52 => 0x2f,
+        54 => 0x3c,
+        56 => 0x3a,
+        57 => 0x31,
+        58 => 0x39,
+        97 => 0x3e,
+        100 => 0x3d,
+        103 => 0x7e,
+        105 => 0x7b,
+        106 => 0x7c,
+        108 => 0x7d,
+        125 => 0x37,
+        126 => 0x36,
+        _ => return None,
+    })
+}
+
 fn post_mouse(event_type: u32, point: CGPoint, button: u32) -> Result<()> {
     let event = unsafe { CGEventCreateMouseEvent(ptr::null(), event_type, point, button) };
     if event.is_null() {
@@ -439,4 +652,41 @@ fn post_scroll(axis: u8, value: f64) -> Result<()> {
         CFRelease(event);
     }
     Ok(())
+}
+
+fn post_key(key: u32, down: bool) -> Result<()> {
+    let Some(mac_key) = evdev_to_mac(key) else {
+        return Ok(());
+    };
+    let event = unsafe { CGEventCreateKeyboardEvent(ptr::null(), mac_key, down) };
+    if event.is_null() {
+        bail!("cannot create macOS keyboard event");
+    }
+    unsafe {
+        CGEventPost(0, event);
+        CFRelease(event);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac_keyboard_mapping_round_trips_common_keys() {
+        for key in [
+            1, 15, 16, 28, 30, 42, 56, 57, 97, 103, 105, 106, 108, 125, 126,
+        ] {
+            assert_eq!(mac_to_evdev(evdev_to_mac(key).unwrap()), Some(key));
+        }
+    }
+
+    #[test]
+    fn mac_modifiers_have_flag_masks() {
+        assert_eq!(modifier_to_evdev(0x38), Some((42, FLAG_SHIFT)));
+        assert_eq!(modifier_to_evdev(0x3b), Some((29, FLAG_CONTROL)));
+        assert_eq!(modifier_to_evdev(0x3d), Some((100, FLAG_OPTION)));
+        assert_eq!(modifier_to_evdev(0x36), Some((126, FLAG_COMMAND)));
+    }
 }
