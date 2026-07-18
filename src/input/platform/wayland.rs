@@ -929,16 +929,11 @@ impl Injector {
     }
 
     pub fn apply_keyboard(&mut self, input: KeyboardInput) -> Result<()> {
+        self.state.keyboard.key(now_ms(), input.key, input.state);
         if input.state == 0 {
-            self.state.keyboard.key(now_ms(), input.key, input.state);
             self.held_keys.remove(&input.key);
         } else {
             self.held_keys.insert(input.key);
-            self.state
-                .keyboard
-                .modifiers(modifiers(&self.held_keys), 0, 0, 0);
-            self.state.keyboard.key(now_ms(), input.key, input.state);
-            return self.flush();
         }
         self.state
             .keyboard

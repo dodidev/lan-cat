@@ -37,6 +37,7 @@ enum Outgoing {
     },
     Sending {
         peer: String,
+        edge: Edge,
         ready: bool,
     },
 }
@@ -117,7 +118,11 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                                 peer.clone(),
                                 InputMessage::Enter { edge: edge.opposite(), position },
                             )?;
-                            outgoing = Some(Outgoing::Sending { peer, ready: false });
+                            outgoing = Some(Outgoing::Sending {
+                                peer,
+                                edge,
+                                ready: false,
+                            });
                             continue;
                         }
                         let now = Instant::now();
@@ -146,15 +151,21 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                                 }
                             }
                         }
-                        Some(Outgoing::Sending { peer, ready: true }) => {
-                            send(&outbound, peer.clone(), InputMessage::Pointer(pointer))?;
+                        Some(Outgoing::Sending { peer, edge, ready }) => {
+                            if is_return_motion(*edge, pointer) {
+                                send_force_leave(&outbound, peer.clone())?;
+                                outgoing = None;
+                                capture.release();
+                            } else if *ready {
+                                send(&outbound, peer.clone(), InputMessage::Pointer(pointer))?;
+                            }
                         }
                         _ => {}
                     },
                     CaptureEvent::Keyboard(keyboard) => {
                         #[cfg(debug_assertions)]
                         update_debug_escape_kill(keyboard, &mut escape_started);
-                        if let Some(Outgoing::Sending { peer, ready: true }) = &outgoing {
+                        if let Some(Outgoing::Sending { peer, ready: true, .. }) = &outgoing {
                             send(&outbound, peer.clone(), InputMessage::Keyboard(keyboard))?;
                         }
                     }
@@ -256,7 +267,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         send(&outbound, peer, InputMessage::Ack)?;
                     }
                     InputMessage::Ack => {
-                        if let Some(Outgoing::Sending { peer: active, ready }) = &mut outgoing {
+                        if let Some(Outgoing::Sending { peer: active, ready, .. }) = &mut outgoing {
                             if *active == peer {
                                 *ready = true;
                                 confirmed_peers.insert(peer);
@@ -326,7 +337,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     if last_push.elapsed() > PRESS_GAP {
                         cancel = Some(peer.clone());
                     } else if *acknowledged && started.elapsed() >= CONFIRM_TIME {
-                        confirm = Some((peer.clone(), edge.opposite(), *position));
+                        confirm = Some((peer.clone(), *edge, *position));
                     }
                 }
                 if let Some(peer) = cancel {
@@ -335,8 +346,19 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     capture.release();
                 }
                 if let Some((peer, edge, position)) = confirm {
-                    send(&outbound, peer.clone(), InputMessage::Enter { edge, position })?;
-                    outgoing = Some(Outgoing::Sending { peer, ready: false });
+                    send(
+                        &outbound,
+                        peer.clone(),
+                        InputMessage::Enter {
+                            edge: edge.opposite(),
+                            position,
+                        },
+                    )?;
+                    outgoing = Some(Outgoing::Sending {
+                        peer,
+                        edge,
+                        ready: false,
+                    });
                 }
                 if preview.as_ref().is_some_and(|value| value.last_probe.elapsed() > PRESS_GAP) {
                     if let Some(mut value) = preview.take() { value.beacon.cancel(); }
@@ -418,6 +440,10 @@ fn pressure(edge: Edge, pointer: protocol::PointerInput) -> Option<(f64, f64)> {
     })
 }
 
+fn is_return_motion(edge: Edge, pointer: protocol::PointerInput) -> bool {
+    pressure(edge, pointer).is_some_and(|(outward, _)| outward < -1.5)
+}
+
 fn send_probe(
     sender: &tokio::sync::mpsc::UnboundedSender<Outbound>,
     peer: String,
@@ -481,6 +507,25 @@ mod tests {
             pressure(Edge::Bottom, PointerInput::Motion { dx: 20.0, dy: 4.0 }),
             Some((4.0, 0.02))
         );
+    }
+
+    #[test]
+    fn reverse_motion_returns_cursor_to_host() {
+        assert!(is_return_motion(
+            Edge::Right,
+            PointerInput::Motion { dx: -2.0, dy: 0.0 }
+        ));
+        assert!(!is_return_motion(
+            Edge::Right,
+            PointerInput::Motion { dx: 2.0, dy: 0.0 }
+        ));
+        assert!(!is_return_motion(
+            Edge::Right,
+            PointerInput::Button {
+                button: 0x110,
+                state: 1,
+            }
+        ));
     }
 
     #[test]
