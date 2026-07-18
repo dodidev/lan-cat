@@ -88,7 +88,6 @@ impl Beacon {
 
 impl Drop for Beacon {
     fn drop(&mut self) {
-        let _ = self.child.try_wait();
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
