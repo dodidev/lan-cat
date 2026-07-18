@@ -2,6 +2,7 @@ mod clipboard;
 mod config;
 mod daemon;
 mod gui;
+mod input;
 mod integration;
 mod ipc;
 mod network;
@@ -47,6 +48,20 @@ enum Command {
     },
     /// Open transfer history window.
     Transfers,
+    /// Configure cursor sharing with a paired peer.
+    Cursor {
+        #[command(subcommand)]
+        action: CursorAction,
+    },
+    #[command(hide = true)]
+    CursorBeaconUi {
+        #[arg(long)]
+        edge: input::protocol::Edge,
+        #[arg(long)]
+        position: f64,
+        #[arg(long)]
+        peer: String,
+    },
     #[command(hide = true)]
     TransferUi {
         #[arg(long)]
@@ -86,6 +101,16 @@ enum IntegrationAction {
     Uninstall,
 }
 
+#[derive(Clone, Subcommand)]
+enum CursorAction {
+    /// Enable automatic edge discovery.
+    Enable,
+    /// Disable cursor sharing.
+    Disable,
+    /// Show cursor-sharing configuration.
+    Status,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -113,6 +138,12 @@ async fn main() -> Result<()> {
         Command::Status => ipc::request(ipc::Request::Status).await,
         Command::Share { paths, peer } => gui::share(paths, peer),
         Command::Transfers => gui::transfers(),
+        Command::Cursor { action } => configure_cursor(action).await,
+        Command::CursorBeaconUi {
+            edge,
+            position,
+            peer,
+        } => input::beacon::run_ui(edge, position, peer),
         Command::TransferUi { id } => gui::receive(id),
         Command::CopyShareUi { paths } => gui::copy_prompt(paths),
         Command::Integration { action } => integration::run(action),
@@ -127,4 +158,32 @@ async fn main() -> Result<()> {
         }
         Command::Service { action } => service::run(action).await,
     }
+}
+
+async fn configure_cursor(action: CursorAction) -> Result<()> {
+    if !matches!(action, CursorAction::Status) && ipc::daemon_available().await {
+        anyhow::bail!("daemon is running; stop it before changing cursor sharing");
+    }
+    let mut cfg = config::Config::load_or_create()?;
+    match action {
+        CursorAction::Enable => {
+            cfg.cursor.enabled = true;
+            cfg.save()?;
+            println!("Automatic cursor discovery enabled.");
+        }
+        CursorAction::Disable => {
+            cfg.cursor = config::CursorConfig::default();
+            cfg.save()?;
+            println!("Cursor sharing disabled.");
+        }
+        CursorAction::Status => println!(
+            "{}",
+            if cfg.cursor.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+    }
+    Ok(())
 }
