@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc as std_mpsc,
     },
     thread,
@@ -58,7 +58,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
-use super::CaptureEvent;
+use super::{ALL_EDGE_MASK, CaptureEvent, edge_mask};
 use crate::input::protocol::{Edge, KeyboardInput, PointerInput};
 
 const EDGE_THICKNESS: u32 = 2;
@@ -83,6 +83,7 @@ struct LinuxInputEvent {
 pub struct Capture {
     pub events: mpsc::UnboundedReceiver<CaptureEvent>,
     active: Arc<AtomicBool>,
+    allowed_edges: Arc<AtomicU8>,
 }
 
 impl Capture {
@@ -90,13 +91,20 @@ impl Capture {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let active = Arc::new(AtomicBool::new(false));
+        let allowed_edges = Arc::new(AtomicU8::new(ALL_EDGE_MASK));
         let thread_active = active.clone();
+        let thread_allowed_edges = allowed_edges.clone();
         let capture_events_tx = events_tx.clone();
 
         thread::Builder::new()
             .name("lan-cat-wayland-capture".into())
             .spawn(move || {
-                let result = run_capture(capture_events_tx, thread_active, ready_tx.clone());
+                let result = run_capture(
+                    capture_events_tx,
+                    thread_active,
+                    thread_allowed_edges,
+                    ready_tx.clone(),
+                );
                 if let Err(error) = result {
                     let _ = ready_tx.send(Err(error));
                 }
@@ -108,11 +116,20 @@ impl Capture {
             .await
             .context("join Wayland capture startup")?
             .context("Wayland capture exited during startup")??;
-        Ok(Self { events, active })
+        Ok(Self {
+            events,
+            active,
+            allowed_edges,
+        })
     }
 
     pub fn release(&self) {
         self.active.store(false, Ordering::Release);
+    }
+
+    pub fn set_allowed_edge(&self, edge: Option<Edge>) {
+        self.allowed_edges
+            .store(edge.map_or(0, edge_mask), Ordering::Release);
     }
 }
 
@@ -272,12 +289,14 @@ struct CaptureState {
     position: f64,
     current_edge: Option<Edge>,
     active: Arc<AtomicBool>,
+    allowed_edges: Arc<AtomicU8>,
     events: mpsc::UnboundedSender<CaptureEvent>,
 }
 
 fn run_capture(
     events: mpsc::UnboundedSender<CaptureEvent>,
     active: Arc<AtomicBool>,
+    allowed_edges: Arc<AtomicU8>,
     ready: std_mpsc::SyncSender<Result<()>>,
 ) -> Result<()> {
     let connection = Connection::connect_to_env().context("connect to Wayland compositor")?;
@@ -353,6 +372,7 @@ fn run_capture(
         position: 0.5,
         current_edge: None,
         active,
+        allowed_edges,
         events,
     };
 
@@ -437,7 +457,9 @@ impl CaptureState {
     }
 
     fn start_capture(&mut self, qh: &QueueHandle<Self>, edge: Edge) {
-        if self.current_edge.is_some() {
+        if self.current_edge.is_some()
+            || self.allowed_edges.load(Ordering::Acquire) & edge_mask(edge) == 0
+        {
             return;
         }
         let (Some(pointer), Some(layer)) = (

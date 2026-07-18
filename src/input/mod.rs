@@ -126,6 +126,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         if incoming.as_ref().is_some_and(|active| active.edge == edge) {
                             let active = incoming.take().expect("incoming cursor");
                             injector.end()?;
+                            capture.set_allowed_edge(None);
                             send(&outbound, active.peer, InputMessage::Leave)?;
                             capture.release();
                             continue;
@@ -208,6 +209,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     CaptureEvent::LocalInput => {
                         if let Some(active) = incoming.take() {
                             injector.end()?;
+                            capture.set_allowed_edge(None);
                             capture.release();
                             takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
                             send_force_leave(&outbound, active.peer)?;
@@ -305,6 +307,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             outgoing = None;
                             capture.release();
                         }
+                        capture.set_allowed_edge(Some(edge));
                         injector.begin(edge, position)?;
                         if portal_role == PortalRole::Undecided {
                             portal_role = PortalRole::Target {
@@ -341,6 +344,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         if incoming.as_ref().is_some_and(|value| value.peer == peer) {
                             injector.end()?;
                             incoming = None;
+                            capture.set_allowed_edge(None);
                         }
                     }
                     InputMessage::Pointer(pointer) => {
@@ -441,6 +445,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         send_force_leave(&outbound, active.peer)?;
                     }
                     injector.end()?;
+                    capture.set_allowed_edge(None);
                 }
             }
         }

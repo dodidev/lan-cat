@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 
-use super::CaptureEvent;
+use super::{ALL_EDGE_MASK, CaptureEvent, edge_mask};
 use crate::input::protocol::{Edge, KeyboardInput, PointerInput};
 
 type CGEventRef = *mut c_void;
@@ -134,6 +134,7 @@ struct State {
     active: bool,
     edge: Edge,
     position: f64,
+    allowed_edges: u8,
     events: mpsc::UnboundedSender<CaptureEvent>,
 }
 
@@ -150,6 +151,7 @@ impl Capture {
             active: false,
             edge: Edge::Right,
             position: 0.5,
+            allowed_edges: ALL_EDGE_MASK,
             events: events_tx,
         }));
         let callback_state = Arc::into_raw(state.clone()) as usize;
@@ -175,6 +177,12 @@ impl Capture {
         unsafe {
             CGDisplayShowCursor(CGMainDisplayID());
             CGWarpMouseCursorPosition(point);
+        }
+    }
+
+    pub fn set_allowed_edge(&self, edge: Option<Edge>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.allowed_edges = edge.map_or(0, edge_mask);
         }
     }
 }
@@ -268,7 +276,9 @@ unsafe extern "C" fn callback(
         let point = unsafe { CGEventGetLocation(event) };
         let dx = unsafe { CGEventGetIntegerValueField(event, FIELD_DELTA_X) } as f64;
         let dy = unsafe { CGEventGetIntegerValueField(event, FIELD_DELTA_Y) } as f64;
-        if let Some((edge, position)) = crossed_edge(point, dx, dy) {
+        if let Some((edge, position)) = crossed_edge(point, dx, dy)
+            && state.allowed_edges & edge_mask(edge) != 0
+        {
             state.active = true;
             state.edge = edge;
             state.position = position;
