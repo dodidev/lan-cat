@@ -160,6 +160,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         if let Some(active) = incoming.take() {
                             injector.end()?;
                             capture.release();
+                            confirmed_peers.remove(&active.peer);
                             takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
                             send_takeover(&outbound, active.peer)?;
                         }
