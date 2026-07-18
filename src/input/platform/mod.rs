@@ -8,10 +8,11 @@ pub use macos::{Capture, Injector};
 #[cfg(target_os = "linux")]
 pub use wayland::{Capture, Injector};
 
-use super::protocol::{Edge, PointerInput};
+use super::protocol::{Edge, KeyboardInput, PointerInput};
 
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureEvent {
     Begin { edge: Edge, position: f64 },
     Pointer(PointerInput),
+    Keyboard(KeyboardInput),
 }

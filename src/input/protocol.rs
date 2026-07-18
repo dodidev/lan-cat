@@ -44,6 +44,21 @@ pub enum PointerInput {
     AxisDiscrete120 { axis: u8, value: i32 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardInput {
+    pub key: u32,
+    pub state: u32,
+}
+
+impl KeyboardInput {
+    pub fn validate(self) -> Result<()> {
+        if self.key > 0x2ff || self.state > 1 {
+            bail!("invalid keyboard input")
+        }
+        Ok(())
+    }
+}
+
 impl PointerInput {
     pub fn validate(self) -> Result<()> {
         match self {
@@ -80,6 +95,7 @@ pub enum InputMessage {
     Ack,
     Leave,
     Pointer(PointerInput),
+    Keyboard(KeyboardInput),
     Ping,
     Pong,
 }
@@ -88,6 +104,7 @@ impl InputMessage {
     pub fn validate(self) -> Result<()> {
         match self {
             Self::Pointer(event) => event.validate()?,
+            Self::Keyboard(event) => event.validate()?,
             Self::Probe {
                 position, progress, ..
             } if !position.is_finite()
@@ -129,6 +146,20 @@ mod tests {
             PointerInput::Motion {
                 dx: f64::NAN,
                 dy: 0.0
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_keyboard_values() {
+        assert!(KeyboardInput { key: 30, state: 1 }.validate().is_ok());
+        assert!(KeyboardInput { key: 30, state: 2 }.validate().is_err());
+        assert!(
+            KeyboardInput {
+                key: 0x300,
+                state: 1
             }
             .validate()
             .is_err()

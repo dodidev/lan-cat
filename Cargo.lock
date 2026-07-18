@@ -1559,6 +1559,7 @@ dependencies = [
  "uuid",
  "wayland-client",
  "wayland-protocols",
+ "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "wl-clipboard-rs",
  "x25519-dalek",

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 
 use super::CaptureEvent;
-use crate::input::protocol::{Edge, PointerInput};
+use crate::input::protocol::{Edge, KeyboardInput, PointerInput};
 
 type CGEventRef = *mut c_void;
 type CFMachPortRef = *mut c_void;
@@ -355,6 +355,10 @@ impl Injector {
                 self.apply(PointerInput::Button { button, state: 0 })?;
             }
         }
+        Ok(())
+    }
+
+    pub fn apply_keyboard(&mut self, _input: KeyboardInput) -> Result<()> {
         Ok(())
     }
 }

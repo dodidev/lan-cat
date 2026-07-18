@@ -113,11 +113,13 @@ pub fn run_ui(edge: Edge, position: f64, _peer: String) -> Result<()> {
 
     let viewport = egui::ViewportBuilder::default()
         .with_title("lan-cat cursor portal")
+        .with_app_id("lan-cat-cursor-portal")
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
         .with_mouse_passthrough(true)
-        .with_maximized(true)
+        .with_resizable(false)
+        .with_fullscreen(true)
         .with_taskbar(false);
     let options = eframe::NativeOptions {
         viewport,

@@ -1,5 +1,6 @@
 use std::{
-    os::fd::AsRawFd,
+    collections::HashSet,
+    os::fd::{AsFd, AsRawFd},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -35,13 +36,19 @@ use smithay_client_toolkit::{
 };
 use tokio::sync::mpsc;
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
+    Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
-    protocol::{wl_buffer, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_surface},
+    protocol::{
+        wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_surface,
+    },
 };
 use wayland_protocols::wp::{
     pointer_constraints::zv1::client::{zwp_confined_pointer_v1, zwp_locked_pointer_v1},
     relative_pointer::zv1::client::zwp_relative_pointer_v1,
+};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
@@ -49,7 +56,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 };
 
 use super::CaptureEvent;
-use crate::input::protocol::{Edge, PointerInput};
+use crate::input::protocol::{Edge, KeyboardInput, PointerInput};
 
 const EDGE_THICKNESS: u32 = 2;
 const POOL_BYTES: usize = 512 * 1024;
@@ -107,9 +114,11 @@ struct CaptureState {
     constraints: PointerConstraintsState,
     layers: Vec<EdgeLayer>,
     pointer: Option<wl_pointer::WlPointer>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
     relative_pointer: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
     locked_pointer: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
     hovered: Option<Edge>,
+    pointer_enter_serial: Option<u32>,
     position: f64,
     current_edge: Option<Edge>,
     active: Arc<AtomicBool>,
@@ -186,9 +195,11 @@ fn run_capture(
         constraints: PointerConstraintsState::bind(&globals, &qh),
         layers,
         pointer: None,
+        keyboard: None,
         relative_pointer: None,
         locked_pointer: None,
         hovered: None,
+        pointer_enter_serial: None,
         position: 0.5,
         current_edge: None,
         active,
@@ -264,7 +275,14 @@ impl CaptureState {
             if let Some(lock) = self.locked_pointer.take() {
                 lock.destroy();
             }
-            self.current_edge = None;
+            if let Some(edge) = self.current_edge.take()
+                && let Some(layer) = self.layers.iter().find(|layer| layer.edge == edge)
+            {
+                layer
+                    .layer
+                    .set_keyboard_interactivity(KeyboardInteractivity::None);
+                layer.layer.commit();
+            }
         }
     }
 
@@ -274,12 +292,15 @@ impl CaptureState {
         }
         let (Some(pointer), Some(layer)) = (
             self.pointer.as_ref(),
-            self.layers.iter().find(|layer| layer.edge == edge),
+            self.layers
+                .iter()
+                .find(|layer| layer.edge == edge)
+                .map(|layer| layer.layer.clone()),
         ) else {
             return;
         };
         let Ok(lock) = self.constraints.lock_pointer(
-            layer.layer.wl_surface(),
+            layer.wl_surface(),
             pointer,
             None,
             wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime::Persistent,
@@ -288,6 +309,11 @@ impl CaptureState {
             return;
         };
         self.locked_pointer = Some(lock);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.commit();
+        if let Some(serial) = self.pointer_enter_serial {
+            pointer.set_cursor(serial, None, 0, 0);
+        }
         self.current_edge = Some(edge);
         self.active.store(true, Ordering::Release);
         let _ = self.events.send(CaptureEvent::Begin {
@@ -394,6 +420,8 @@ impl SeatHandler for CaptureState {
                     .ok();
                 self.pointer = Some(pointer);
             }
+        } else if capability == Capability::Keyboard && self.keyboard.is_none() {
+            self.keyboard = Some(seat.get_keyboard(qh, ()));
         }
     }
     fn remove_capability(
@@ -404,10 +432,16 @@ impl SeatHandler for CaptureState {
         capability: Capability,
     ) {
         if capability == Capability::Pointer {
-            self.relative_pointer
-                .take()
-                .map(|pointer| pointer.destroy());
-            self.pointer.take().map(|pointer| pointer.release());
+            if let Some(pointer) = self.relative_pointer.take() {
+                pointer.destroy();
+            }
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        } else if capability == Capability::Keyboard {
+            if let Some(keyboard) = self.keyboard.take() {
+                keyboard.release();
+            }
         }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
@@ -426,7 +460,25 @@ impl PointerHandler for CaptureState {
                 .layer_for_surface(&event.surface)
                 .map(|layer| layer.edge);
             match event.kind {
-                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                PointerEventKind::Enter { serial } => {
+                    self.pointer_enter_serial = Some(serial);
+                    if let Some(edge) = edge {
+                        self.hovered = Some(edge);
+                        if let Some(layer) = self.layer_for_surface(&event.surface) {
+                            let span = match edge {
+                                Edge::Left | Edge::Right => layer.height,
+                                _ => layer.width,
+                            }
+                            .max(1);
+                            let coordinate = match edge {
+                                Edge::Left | Edge::Right => event.position.1,
+                                _ => event.position.0,
+                            };
+                            self.position = (coordinate / f64::from(span)).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                PointerEventKind::Motion { .. } => {
                     if let Some(edge) = edge {
                         self.hovered = Some(edge);
                         if let Some(layer) = self.layer_for_surface(&event.surface) {
@@ -444,6 +496,7 @@ impl PointerHandler for CaptureState {
                     }
                 }
                 PointerEventKind::Leave { .. } => {
+                    self.pointer_enter_serial = None;
                     if self.current_edge.is_none() {
                         self.hovered = None;
                     }
@@ -501,6 +554,39 @@ impl PointerHandler for CaptureState {
                 _ => {}
             }
         }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for CaptureState {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let wl_keyboard::Event::Key {
+            key,
+            state: key_state,
+            ..
+        } = event
+        else {
+            return;
+        };
+        if state.current_edge.is_none() {
+            return;
+        }
+        let key_state = match key_state {
+            WEnum::Value(wl_keyboard::KeyState::Released) => 0,
+            WEnum::Value(wl_keyboard::KeyState::Pressed) => 1,
+            WEnum::Unknown(_) => return,
+            _ => return,
+        };
+        let _ = state.events.send(CaptureEvent::Keyboard(KeyboardInput {
+            key,
+            state: key_state,
+        }));
     }
 }
 
@@ -603,25 +689,50 @@ pub struct Injector {
     queue: wayland_client::EventQueue<InjectorState>,
     state: InjectorState,
     pointer: ZwlrVirtualPointerV1,
+    _keyboard: wl_keyboard::WlKeyboard,
+    held_keys: HashSet<u32>,
 }
 
-struct InjectorState;
+struct InjectorState {
+    keyboard: ZwpVirtualKeyboardV1,
+    keymap_ready: bool,
+}
 
 impl Injector {
     pub async fn new() -> Result<Self> {
         let connection = Connection::connect_to_env().context("connect injector to Wayland")?;
-        let (globals, queue) =
+        let (globals, mut queue) =
             registry_queue_init::<InjectorState>(&connection).context("read injector globals")?;
         let qh = queue.handle();
+        let seat: wl_seat::WlSeat = globals
+            .bind(&qh, 1..=7, ())
+            .map_err(|_| anyhow!("Wayland seat unavailable"))?;
         let manager: ZwlrVirtualPointerManagerV1 = globals
             .bind(&qh, 1..=2, ())
             .map_err(|_| anyhow!("wlr-virtual-pointer protocol unavailable"))?;
         let pointer = manager.create_virtual_pointer(None, &qh, ());
+        let keyboard_manager: ZwpVirtualKeyboardManagerV1 = globals
+            .bind(&qh, 1..=1, ())
+            .map_err(|_| anyhow!("virtual-keyboard protocol unavailable"))?;
+        let keyboard = keyboard_manager.create_virtual_keyboard(&seat, &qh, ());
+        let physical_keyboard = seat.get_keyboard(&qh, ());
+        let mut state = InjectorState {
+            keyboard,
+            keymap_ready: false,
+        };
+        queue
+            .roundtrip(&mut state)
+            .context("read Wayland keyboard map")?;
+        if !state.keymap_ready {
+            bail!("Wayland seat did not provide an XKB keymap");
+        }
         Ok(Self {
             connection,
             queue,
-            state: InjectorState,
+            state,
             pointer,
+            _keyboard: physical_keyboard,
+            held_keys: HashSet::new(),
         })
     }
 
@@ -667,7 +778,20 @@ impl Injector {
         self.flush()
     }
 
+    pub fn apply_keyboard(&mut self, input: KeyboardInput) -> Result<()> {
+        if input.state == 0 {
+            self.held_keys.remove(&input.key);
+        } else {
+            self.held_keys.insert(input.key);
+        }
+        self.state.keyboard.key(now_ms(), input.key, input.state);
+        self.flush()
+    }
+
     pub fn end(&mut self) -> Result<()> {
+        for key in self.held_keys.drain() {
+            self.state.keyboard.key(now_ms(), key, 0);
+        }
         self.pointer.frame();
         self.flush()
     }
@@ -707,6 +831,27 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for InjectorState {
     ) {
     }
 }
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for InjectorState {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let wl_keyboard::Event::Keymap { format, fd, size } = event else {
+            return;
+        };
+        if matches!(format, WEnum::Value(wl_keyboard::KeymapFormat::XkbV1)) {
+            state.keyboard.keymap(1, fd.as_fd(), size);
+            state.keymap_ready = true;
+        }
+    }
+}
+delegate_noop!(InjectorState: ignore wl_seat::WlSeat);
 delegate_noop!(InjectorState: ignore ZwlrVirtualPointerManagerV1);
 delegate_noop!(InjectorState: ignore ZwlrVirtualPointerV1);
+delegate_noop!(InjectorState: ignore ZwpVirtualKeyboardManagerV1);
+delegate_noop!(InjectorState: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(InjectorState: ignore wl_buffer::WlBuffer);

@@ -4,7 +4,7 @@ pub mod protocol;
 mod transport;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -72,6 +72,7 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
     let mut outgoing: Option<Outgoing> = None;
     let mut incoming: Option<Incoming> = None;
     let mut preview: Option<Preview> = None;
+    let mut confirmed_peers = HashSet::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut last_ping = Instant::now() - Duration::from_secs(1);
@@ -96,6 +97,15 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             capture.release();
                             continue;
                         };
+                        if confirmed_peers.contains(&peer) {
+                            send(
+                                &outbound,
+                                peer.clone(),
+                                InputMessage::Enter { edge: edge.opposite(), position },
+                            )?;
+                            outgoing = Some(Outgoing::Sending { peer, ready: false });
+                            continue;
+                        }
                         let now = Instant::now();
                         outgoing = Some(Outgoing::Probing {
                             peer: peer.clone(),
@@ -127,19 +137,29 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                         }
                         _ => {}
                     },
+                    CaptureEvent::Keyboard(keyboard) => {
+                        if let Some(Outgoing::Sending { peer, ready: true }) = &outgoing {
+                            send(&outbound, peer.clone(), InputMessage::Keyboard(keyboard))?;
+                        }
+                    }
                 }
             }
             event = inbound.recv() => {
                 let Some(Inbound { peer, message }) = event else { anyhow::bail!("cursor transport stopped") };
-                message.validate()?;
-                last_seen.insert(peer.clone(), Instant::now());
-                match message {
-                    InputMessage::Probe { edge, position, progress } => {
-                        if incoming.is_some() {
-                            send(&outbound, peer, InputMessage::Cancel)?;
-                            continue;
-                        }
-                        let replace = preview.as_ref().is_none_or(|value| value.peer != peer || value.edge != edge);
+                    message.validate()?;
+                    last_seen.insert(peer.clone(), Instant::now());
+                    match message {
+                        InputMessage::Probe { edge, position, progress } => {
+                            if incoming.is_some() {
+                                send(&outbound, peer, InputMessage::Cancel)?;
+                                continue;
+                            }
+                            // Confirmed peers may enter directly; do not replay the portal UI.
+                            if confirmed_peers.contains(&peer) {
+                                send(&outbound, peer, InputMessage::ProbeAck)?;
+                                continue;
+                            }
+                            let replace = preview.as_ref().is_none_or(|value| value.peer != peer || value.edge != edge);
                         if replace {
                             if let Some(mut old) = preview.take() { old.beacon.cancel(); }
                             preview = Some(Preview {
@@ -179,7 +199,10 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                                 && value.last_probe.elapsed() <= PRESS_GAP
                         });
                         let outgoing_wins = outgoing.is_some() && local_id > peer;
-                        if !preview_matches || incoming.is_some() || outgoing_wins {
+                        if (!preview_matches && !confirmed_peers.contains(&peer))
+                            || incoming.is_some()
+                            || outgoing_wins
+                        {
                             send(&outbound, peer, InputMessage::Cancel)?;
                             continue;
                         }
@@ -189,12 +212,16 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             capture.release();
                         }
                         injector.begin(edge, position)?;
+                        confirmed_peers.insert(peer.clone());
                         incoming = Some(Incoming { peer: peer.clone(), edge });
                         send(&outbound, peer, InputMessage::Ack)?;
                     }
                     InputMessage::Ack => {
                         if let Some(Outgoing::Sending { peer: active, ready }) = &mut outgoing {
-                            if *active == peer { *ready = true; }
+                            if *active == peer {
+                                *ready = true;
+                                confirmed_peers.insert(peer);
+                            }
                         }
                     }
                     InputMessage::Leave => {
@@ -210,6 +237,11 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                     InputMessage::Pointer(pointer) => {
                         if incoming.as_ref().is_some_and(|value| value.peer == peer) {
                             injector.apply(pointer)?;
+                        }
+                    }
+                    InputMessage::Keyboard(keyboard) => {
+                        if incoming.as_ref().is_some_and(|value| value.peer == peer) {
+                            injector.apply_keyboard(keyboard)?;
                         }
                     }
                     InputMessage::Ping => send(&outbound, peer, InputMessage::Pong)?,
