@@ -358,6 +358,7 @@ async fn send_data(
         message,
         InputMessage::Enter { .. }
             | InputMessage::Ack
+            | InputMessage::Cancel
             | InputMessage::Leave
             | InputMessage::Pointer(PointerInput::Button { .. })
     ) {

@@ -209,6 +209,10 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             outgoing = None;
                             capture.release();
                         }
+                        if incoming.as_ref().is_some_and(|value| value.peer == peer) {
+                            injector.end()?;
+                            incoming = None;
+                        }
                         if preview.as_ref().is_some_and(|value| value.peer == peer) {
                             if let Some(mut value) = preview.take() { value.beacon.cancel(); }
                         }
@@ -425,8 +429,8 @@ fn send_takeover(
     sender: &tokio::sync::mpsc::UnboundedSender<Outbound>,
     peer: String,
 ) -> Result<()> {
-    send(sender, peer.clone(), InputMessage::Leave)?;
-    send(sender, peer, InputMessage::Cancel)
+    send(sender, peer.clone(), InputMessage::Cancel)?;
+    send(sender, peer, InputMessage::Leave)
 }
 
 fn outgoing_peer(value: &Outgoing) -> &str {
