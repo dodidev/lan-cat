@@ -5,10 +5,12 @@ mod transport;
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
+use tokio::sync::RwLock;
 
 use crate::config::Config;
 use beacon::Beacon;
@@ -78,7 +80,7 @@ impl PortalRole {
     }
 }
 
-pub fn spawn(cfg: Config, local_id: String) -> Result<()> {
+pub fn spawn(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
     std::thread::Builder::new()
         .name("lan-cat-input".into())
         .spawn(move || {
@@ -96,10 +98,10 @@ pub fn spawn(cfg: Config, local_id: String) -> Result<()> {
     Ok(())
 }
 
-async fn run(cfg: Config, local_id: String) -> Result<()> {
+async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
     let mut capture = Capture::new().await?;
     let mut injector = Injector::new().await?;
-    let (outbound, mut inbound) = transport::start(&cfg, &local_id).await?;
+    let (outbound, mut inbound) = transport::start(cfg.clone(), &local_id).await?;
     let mut outgoing: Option<Outgoing> = None;
     let mut incoming: Option<Incoming> = None;
     let mut preview: Option<Preview> = None;
@@ -138,13 +140,17 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
                             capture.release();
                             continue;
                         }
-                        let Some(peer) = select_peer(
-                            &cfg,
-                            &last_seen,
-                            &portal_edges,
-                            edge,
-                            position,
-                        ) else {
+                        let peer = {
+                            let cfg = cfg.read().await;
+                            select_peer(
+                                &cfg,
+                                &last_seen,
+                                &portal_edges,
+                                edge,
+                                position,
+                            )
+                        };
+                        let Some(peer) = peer else {
                             capture.release();
                             continue;
                         };
@@ -375,8 +381,32 @@ async fn run(cfg: Config, local_id: String) -> Result<()> {
             }
             _ = tick.tick() => {
                 let now = Instant::now();
+                let trusted_peers: HashSet<_> = cfg.read().await.peers.keys().cloned().collect();
+                if outgoing
+                    .as_ref()
+                    .is_some_and(|value| !trusted_peers.contains(outgoing_peer(value)))
+                {
+                    outgoing = None;
+                    capture.release();
+                }
+                if incoming
+                    .as_ref()
+                    .is_some_and(|value| !trusted_peers.contains(&value.peer))
+                {
+                    incoming = None;
+                    injector.end()?;
+                    capture.set_allowed_edge(None);
+                }
+                confirmed_peers.retain(|peer| trusted_peers.contains(peer));
+                portal_edges.retain(|peer, _| trusted_peers.contains(peer));
+                if matches!(
+                    &portal_role,
+                    PortalRole::Target { controller } if !trusted_peers.contains(controller)
+                ) {
+                    portal_role = PortalRole::Undecided;
+                }
                 if last_ping.elapsed() >= Duration::from_millis(500) {
-                    for peer in cfg.peers.keys() {
+                    for peer in &trusted_peers {
                         send(&outbound, peer.clone(), InputMessage::Ping)?;
                     }
                     last_ping = now;

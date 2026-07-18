@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -11,7 +12,10 @@ use chacha20poly1305::{
 };
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{
+    net::UdpSocket,
+    sync::{RwLock, mpsc},
+};
 use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};
 
 use super::protocol::{InputMessage, PointerInput};
@@ -62,7 +66,7 @@ struct Session {
 }
 
 pub async fn start(
-    cfg: &Config,
+    cfg: Arc<RwLock<Config>>,
     local_id: &str,
 ) -> Result<(
     mpsc::UnboundedSender<Outbound>,
@@ -75,7 +79,6 @@ pub async fn start(
     let browse = mdns.browse(SERVICE)?;
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-    let cfg = cfg.clone();
     let local_id = local_id.to_owned();
     tokio::task::spawn_local(async move {
         if let Err(error) = run(socket, mdns, browse, cfg, local_id, outbound_rx, inbound_tx).await
@@ -90,7 +93,7 @@ async fn run(
     socket: UdpSocket,
     mdns: ServiceDaemon,
     browse: mdns_sd::Receiver<ServiceEvent>,
-    cfg: Config,
+    cfg: Arc<RwLock<Config>>,
     local_id: String,
     mut outbound: mpsc::UnboundedReceiver<Outbound>,
     inbound: mpsc::UnboundedSender<Inbound>,
@@ -110,6 +113,7 @@ async fn run(
                 match event {
                     Ok(ServiceEvent::ServiceResolved(info)) => {
                         let Some((peer, addr)) = resolved_peer(&info) else { continue };
+                        let cfg = cfg.read().await;
                         if peer == local_id || !is_cursor_peer(&cfg, &peer) { continue; }
                         addresses.insert(peer.clone(), addr);
                         if let Err(error) = send_hello(
@@ -132,6 +136,7 @@ async fn run(
                     tracing::debug!(error = %received.expect_err("recv error"), "cursor UDP receive failed");
                     continue;
                 };
+                let cfg = cfg.read().await;
                 if let Err(error) = receive_datagram(
                     &socket,
                     &cfg,
@@ -150,6 +155,12 @@ async fn run(
             }
             message = outbound.recv() => {
                 let Some(message) = message else { break };
+                let cfg = cfg.read().await;
+                if !is_cursor_peer(&cfg, &message.peer) {
+                    sessions.remove(&message.peer);
+                    addresses.remove(&message.peer);
+                    continue;
+                }
                 if let Some(session) = sessions.get_mut(&message.peer) {
                     if let Err(error) = send_data(&socket, &local_id, session, message.message).await {
                         tracing::debug!(peer = %message.peer, %error, "cursor data send failed");
@@ -168,6 +179,9 @@ async fn run(
                 }
             }
             _ = hello_tick.tick() => {
+                let cfg = cfg.read().await;
+                addresses.retain(|peer, _| is_cursor_peer(&cfg, peer));
+                sessions.retain(|peer, _| is_cursor_peer(&cfg, peer));
                 let peers: Vec<_> = addresses.iter().map(|(peer, &addr)| (peer.clone(), addr)).collect();
                 for (peer, addr) in peers {
                     if !sessions.contains_key(&peer) {
@@ -280,8 +294,8 @@ async fn receive_datagram(
             sequence,
             ciphertext,
         } => {
-            if version != WIRE_VERSION {
-                bail!("unsupported cursor protocol version");
+            if version != WIRE_VERSION || !is_cursor_peer(cfg, &sender) {
+                bail!("unknown cursor peer or protocol version");
             }
             let session = sessions
                 .get_mut(&sender)
@@ -533,7 +547,32 @@ fn resolved_peer(info: &mdns_sd::ResolvedService) -> Option<(String, SocketAddr)
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::{
+        config::{CursorConfig, Peer},
+        ordering::VersionVector,
+    };
+
+    fn cursor_config() -> Config {
+        Config {
+            version: 1,
+            name: "local".to_owned(),
+            private_key: "00".repeat(32),
+            public_key: "11".repeat(32),
+            paused: false,
+            peers: BTreeMap::from([(
+                "peer".to_owned(),
+                Peer {
+                    name: "peer".to_owned(),
+                    public_key: "22".repeat(32),
+                },
+            )]),
+            cursor: CursorConfig { enabled: true },
+            clock: VersionVector::default(),
+        }
+    }
 
     #[test]
     fn replay_window_accepts_reordered_packets_once() {
@@ -564,5 +603,14 @@ mod tests {
         let encrypted = encrypt(&key, "peer-a", 8, b"motion").unwrap();
         assert_eq!(decrypt(&key, "peer-a", 8, &encrypted).unwrap(), b"motion");
         assert!(decrypt(&key, "peer-a", 9, &encrypted).is_err());
+    }
+
+    #[test]
+    fn unpaired_peer_loses_cursor_trust_immediately() {
+        let mut cfg = cursor_config();
+        assert!(is_cursor_peer(&cfg, "peer"));
+
+        cfg.peers.remove("peer");
+        assert!(!is_cursor_peer(&cfg, "peer"));
     }
 }

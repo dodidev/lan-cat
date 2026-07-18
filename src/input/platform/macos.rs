@@ -1,10 +1,7 @@
 use std::{
     ffi::{c_double, c_int, c_long, c_void},
     ptr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, bail};
@@ -72,8 +69,6 @@ const FLAG_SHIFT: u64 = 1 << 17;
 const FLAG_CONTROL: u64 = 1 << 18;
 const FLAG_OPTION: u64 = 1 << 19;
 const FLAG_COMMAND: u64 = 1 << 20;
-
-static REMOTE_INJECTING: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -269,7 +264,7 @@ unsafe extern "C" fn callback(
     };
     let synthetic = unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_USER_DATA) }
         == SYNTHETIC_EVENT_TAG;
-    if synthetic && !REMOTE_INJECTING.load(Ordering::Acquire) {
+    if synthetic {
         return event;
     }
     if !state.active && is_motion(event_type) {
@@ -391,16 +386,11 @@ impl Injector {
     }
 
     pub fn begin(&mut self, edge: Edge, position: f64) -> Result<()> {
-        REMOTE_INJECTING.store(true, Ordering::Release);
         self.point = edge_point(edge, position, 3.0);
         unsafe {
             CGWarpMouseCursorPosition(self.point);
         }
-        let result = post_mouse(MOUSE_MOVED, self.point, 0);
-        if result.is_err() {
-            REMOTE_INJECTING.store(false, Ordering::Release);
-        }
-        result
+        post_mouse(MOUSE_MOVED, self.point, 0)
     }
 
     pub fn apply(&mut self, input: PointerInput) -> Result<()> {
@@ -453,7 +443,6 @@ impl Injector {
         for key in std::mem::take(&mut self.held_keys) {
             post_key(key, false)?;
         }
-        REMOTE_INJECTING.store(false, Ordering::Release);
         Ok(())
     }
 
