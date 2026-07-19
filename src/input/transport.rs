@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -25,6 +25,7 @@ const SERVICE: &str = "_lan-cat-input._udp.local.";
 const PORT: u16 = 4242;
 const WIRE_VERSION: u8 = 1;
 const MAX_DATAGRAM: usize = 4096;
+const MAX_PENDING_MESSAGES: usize = 32;
 
 #[derive(Debug)]
 pub struct Outbound {
@@ -103,6 +104,7 @@ async fn run(
     let local_nonce: [u8; 16] = rand::random();
     let mut addresses = HashMap::<String, SocketAddr>::new();
     let mut sessions = HashMap::<String, Session>::new();
+    let mut pending = HashMap::<String, VecDeque<InputMessage>>::new();
     let mut seen_handshakes = HashSet::<(String, [u8; 32], [u8; 16])>::new();
     let mut buffer = vec![0_u8; MAX_DATAGRAM];
     let mut hello_tick = tokio::time::interval(Duration::from_secs(1));
@@ -137,7 +139,7 @@ async fn run(
                     continue;
                 };
                 let cfg = cfg.read().await;
-                if let Err(error) = receive_datagram(
+                match receive_datagram(
                     &socket,
                     &cfg,
                     &local_id,
@@ -150,7 +152,17 @@ async fn run(
                     &mut seen_handshakes,
                     &inbound,
                 ).await {
-                    tracing::debug!(%addr, %error, "ignored cursor datagram");
+                    Ok(Some(peer)) => {
+                        if let Err(error) = flush_pending(&socket, &local_id, &mut sessions, &mut pending, &peer).await {
+                            tracing::debug!(%peer, %error, "cursor pending send failed");
+                            sessions.remove(&peer);
+                            addresses.remove(&peer);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::debug!(%addr, %error, "ignored cursor datagram");
+                    }
                 }
             }
             message = outbound.recv() => {
@@ -159,6 +171,7 @@ async fn run(
                 if !is_cursor_peer(&cfg, &message.peer) {
                     sessions.remove(&message.peer);
                     addresses.remove(&message.peer);
+                    pending.remove(&message.peer);
                     continue;
                 }
                 if let Some(session) = sessions.get_mut(&message.peer) {
@@ -176,12 +189,17 @@ async fn run(
                         tracing::debug!(peer = %message.peer, %addr, %error, "cursor hello send failed");
                         addresses.remove(&message.peer);
                     }
+                    queue_pending(&mut pending, message.peer, message.message);
+                } else {
+                    tracing::debug!(peer = %message.peer, "cursor peer address unavailable; queued message");
+                    queue_pending(&mut pending, message.peer, message.message);
                 }
             }
             _ = hello_tick.tick() => {
                 let cfg = cfg.read().await;
                 addresses.retain(|peer, _| is_cursor_peer(&cfg, peer));
                 sessions.retain(|peer, _| is_cursor_peer(&cfg, peer));
+                pending.retain(|peer, _| is_cursor_peer(&cfg, peer));
                 let peers: Vec<_> = addresses.iter().map(|(peer, &addr)| (peer.clone(), addr)).collect();
                 for (peer, addr) in peers {
                     if !sessions.contains_key(&peer) {
@@ -215,7 +233,7 @@ async fn receive_datagram(
     sessions: &mut HashMap<String, Session>,
     seen_handshakes: &mut HashSet<(String, [u8; 32], [u8; 16])>,
     inbound: &mpsc::UnboundedSender<Inbound>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let wire: Wire = serde_cbor::from_slice(bytes)?;
     match wire {
         Wire::Hello {
@@ -287,6 +305,7 @@ async fn receive_datagram(
                 )
                 .await?;
             }
+            Ok(Some(sender))
         }
         Wire::Data {
             version,
@@ -317,7 +336,39 @@ async fn receive_datagram(
                 peer: sender,
                 message,
             })?;
+            Ok(None)
         }
+    }
+}
+
+fn queue_pending(
+    pending: &mut HashMap<String, VecDeque<InputMessage>>,
+    peer: String,
+    message: InputMessage,
+) {
+    let queue = pending.entry(peer).or_default();
+    if queue.len() == MAX_PENDING_MESSAGES {
+        queue.pop_front();
+    }
+    queue.push_back(message);
+}
+
+async fn flush_pending(
+    socket: &UdpSocket,
+    local_id: &str,
+    sessions: &mut HashMap<String, Session>,
+    pending: &mut HashMap<String, VecDeque<InputMessage>>,
+    peer: &str,
+) -> Result<()> {
+    let Some(mut queue) = pending.remove(peer) else {
+        return Ok(());
+    };
+    let Some(session) = sessions.get_mut(peer) else {
+        pending.insert(peer.to_owned(), queue);
+        return Ok(());
+    };
+    while let Some(message) = queue.pop_front() {
+        send_data(socket, local_id, session, message).await?;
     }
     Ok(())
 }
