@@ -119,10 +119,12 @@ pub fn run_ui(edge: Edge, position: f64, _peer: String) -> Result<()> {
         .with_app_id("lan-cat-cursor-portal")
         .with_decorations(false)
         .with_transparent(true)
+        .with_has_shadow(false)
+        .with_active(false)
         .with_always_on_top()
         .with_mouse_passthrough(true)
         .with_resizable(false)
-        .with_fullscreen(true)
+        .with_maximized(true)
         .with_taskbar(false);
     let options = eframe::NativeOptions {
         viewport,
@@ -469,5 +471,9 @@ impl eframe::App for PortalApp {
         painter.circle_filled(cursor_point + highlight_offset, highlight_size, highlight);
 
         ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
 }

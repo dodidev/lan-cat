@@ -51,7 +51,7 @@ enum Control {
 }
 
 pub async fn run() -> Result<()> {
-    configure_copy_prompt_window();
+    configure_wayland_windows();
     let cfg = Config::load_or_create()?;
     let id = network::device_id(&cfg.public_key()?);
     let mut clipboard = Clipboard::start()?;
@@ -215,27 +215,37 @@ pub async fn run() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn configure_copy_prompt_window() {
+fn configure_wayland_windows() {
     if std::env::var_os("SWAYSOCK").is_none() {
         return;
     }
-    let status = std::process::Command::new("swaymsg")
-        .args([
-            "for_window",
-            r#"[app_id="lan-cat-copy-prompt"]"#,
-            "floating enable, move position center",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    if !status.is_ok_and(|status| status.success()) {
+    if !register_sway_rule(
+        r#"[app_id="lan-cat-copy-prompt"]"#,
+        "floating enable, move position center",
+    ) {
         tracing::warn!("could not register Sway floating rule for copy prompt");
+    }
+    if !register_sway_rule(
+        r#"[app_id="lan-cat-cursor-portal"]"#,
+        "floating enable, border none, move position 0 0, resize set 100 ppt 100 ppt",
+    ) {
+        tracing::warn!("could not register Sway floating rule for cursor portal");
     }
 }
 
+#[cfg(target_os = "linux")]
+fn register_sway_rule(criteria: &str, command: &str) -> bool {
+    std::process::Command::new("swaymsg")
+        .args(["for_window", criteria, command])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[cfg(not(target_os = "linux"))]
-fn configure_copy_prompt_window() {}
+fn configure_wayland_windows() {}
 
 #[allow(clippy::too_many_arguments)]
 async fn publish_local_payload(
