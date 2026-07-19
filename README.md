@@ -1,10 +1,10 @@
 # lan-cat
 
-Secure, peer-to-peer clipboard sync and LAN file sharing for macOS and Linux Wayland desktops.
+Secure, peer-to-peer clipboard sync, input sharing, and LAN file transfer for macOS and Linux Wayland desktops.
 
 ## Overview
 
-`lan-cat` provides seamless clipboard synchronization and file sharing between trusted devices on your local network. It uses modern cryptography (Noise protocol) to ensure security and privacy while maintaining a simple user experience.
+`lan-cat` provides seamless clipboard synchronization, remote input control (cursor and keyboard), and file sharing between trusted devices on your local network. It uses modern cryptography (Noise protocol) to ensure security and privacy while maintaining a simple user experience.
 
 **Key principles:**
 - **Privacy-first**: No cloud, no accounts, no telemetry. All data stays on your LAN.
