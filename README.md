@@ -362,7 +362,6 @@ rule for your compositor:
 ```text
 # Sway
 for_window [app_id="lan-cat-copy-prompt"] floating enable, move position center
-for_window [app_id="lan-cat-cursor-portal"] floating enable, border none, move position 0 0, resize set 100 ppt 100 ppt
 
 # Hyprland 0.55+ (Lua config)
 hl.window_rule({
