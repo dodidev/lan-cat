@@ -114,18 +114,17 @@ pub fn run_ui(edge: Edge, position: f64, _peer: String) -> Result<()> {
         });
     });
 
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("lan-cat cursor portal")
-        .with_app_id("lan-cat-cursor-portal")
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_has_shadow(false)
-        .with_active(false)
-        .with_always_on_top()
-        .with_mouse_passthrough(true)
-        .with_resizable(false)
-        .with_maximized(true)
-        .with_taskbar(false);
+    let viewport = configure_portal_viewport(
+        egui::ViewportBuilder::default()
+            .with_title("lan-cat cursor portal")
+            .with_app_id("lan-cat-cursor-portal")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_mouse_passthrough(true)
+            .with_resizable(false)
+            .with_taskbar(false),
+    );
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
@@ -136,6 +135,23 @@ pub fn run_ui(edge: Edge, position: f64, _peer: String) -> Result<()> {
         Box::new(move |_cc| Ok(Box::new(PortalApp::new(edge, position, updates_rx)))),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn configure_portal_viewport(viewport: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    viewport
+        .with_has_shadow(false)
+        .with_active(false)
+        .with_maximized(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_portal_viewport(viewport: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    if std::env::var_os("SWAYSOCK").is_some() {
+        viewport.with_fullscreen(true)
+    } else {
+        viewport.with_active(false).with_maximized(true)
+    }
 }
 
 struct PortalApp {
