@@ -114,16 +114,17 @@ pub fn run_ui(edge: Edge, position: f64, _peer: String) -> Result<()> {
         });
     });
 
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("lan-cat cursor portal")
-        .with_app_id("lan-cat-cursor-portal")
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_always_on_top()
-        .with_mouse_passthrough(true)
-        .with_resizable(false)
-        .with_fullscreen(true)
-        .with_taskbar(false);
+    let viewport = configure_portal_viewport(
+        egui::ViewportBuilder::default()
+            .with_title("lan-cat cursor portal")
+            .with_app_id("lan-cat-cursor-portal")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_mouse_passthrough(true)
+            .with_resizable(false)
+            .with_taskbar(false),
+    );
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
@@ -136,6 +137,23 @@ pub fn run_ui(edge: Edge, position: f64, _peer: String) -> Result<()> {
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+#[cfg(target_os = "macos")]
+fn configure_portal_viewport(viewport: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    viewport
+        .with_has_shadow(false)
+        .with_active(false)
+        .with_maximized(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_portal_viewport(viewport: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    if std::env::var_os("SWAYSOCK").is_some() {
+        viewport.with_fullscreen(true)
+    } else {
+        viewport.with_active(false).with_maximized(true)
+    }
+}
+
 struct PortalApp {
     edge: Edge,
     position: f32,
@@ -145,6 +163,7 @@ struct PortalApp {
     updates: mpsc::Receiver<Update>,
     transition: Option<(Instant, bool)>,
     last_frame: Instant,
+    animation_time: f32,
 }
 
 impl PortalApp {
@@ -158,6 +177,7 @@ impl PortalApp {
             updates,
             transition: None,
             last_frame: Instant::now(),
+            animation_time: 0.0,
         }
     }
 }
@@ -177,6 +197,8 @@ impl eframe::App for PortalApp {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
+        self.animation_time += dt;
+
         let smoothing = 1.0 - (-14.0 * dt).exp();
         self.progress += (self.target_progress - self.progress) * smoothing;
         self.displayed_position += (self.position - self.displayed_position) * smoothing;
@@ -195,46 +217,279 @@ impl eframe::App for PortalApp {
         }
 
         let rect = ctx.screen_rect();
-        let depth = 10.0 + self.progress * 74.0 + snap * 9.0;
-        let radius = 9.0 + self.progress * 5.0;
+
+        // Universal Control-style animation parameters
+        let base_depth = 8.0;
+        let max_depth = 95.0;
+        let depth = base_depth + self.progress * max_depth + snap * 12.0;
+        let cursor_size = 11.0 + self.progress * 2.0;
+
         let along = match self.edge {
             Edge::Left | Edge::Right => rect.top() + rect.height() * self.displayed_position,
             Edge::Top | Edge::Bottom => rect.left() + rect.width() * self.displayed_position,
         };
-        let (anchor, head) = match self.edge {
+
+        let (edge_point, cursor_point, is_horizontal) = match self.edge {
             Edge::Left => (
-                egui::pos2(rect.left() - 2.0, along),
+                egui::pos2(rect.left(), along),
                 egui::pos2(rect.left() + depth, along),
+                false,
             ),
             Edge::Right => (
-                egui::pos2(rect.right() + 2.0, along),
+                egui::pos2(rect.right(), along),
                 egui::pos2(rect.right() - depth, along),
+                false,
             ),
             Edge::Top => (
-                egui::pos2(along, rect.top() - 2.0),
+                egui::pos2(along, rect.top()),
                 egui::pos2(along, rect.top() + depth),
+                true,
             ),
             Edge::Bottom => (
-                egui::pos2(along, rect.bottom() + 2.0),
+                egui::pos2(along, rect.bottom()),
                 egui::pos2(along, rect.bottom() - depth),
+                true,
             ),
         };
+
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("cursor-portal"),
         ));
-        let shadow = egui::Color32::from_rgba_premultiplied(0, 0, 0, 85);
-        let fluid = egui::Color32::from_rgb(238, 242, 247);
-        painter.line_segment([anchor, head], egui::Stroke::new(radius * 1.45, shadow));
-        painter.circle_filled(head, radius + 2.5, shadow);
-        painter.line_segment([anchor, head], egui::Stroke::new(radius, fluid));
-        painter.circle_filled(head, radius, fluid);
-        painter.circle_filled(
-            head + egui::vec2(-radius * 0.22, -radius * 0.25),
-            radius * 0.23,
-            egui::Color32::WHITE,
-        );
+
+        // Universal Control portal animation
+        if self.progress > 0.01 {
+            // Pulsing animation (subtle breathing effect)
+            let pulse = (self.animation_time * 2.5).sin() * 0.15 + 1.0;
+
+            // Calculate bezier curve control point for fluid pull effect
+            let pull_amount = 80.0 * self.progress * self.progress;
+            let control_point = if is_horizontal {
+                let side_offset = if self.edge == Edge::Top { 1.0 } else { -1.0 };
+                edge_point
+                    + egui::vec2(0.0, pull_amount * side_offset)
+                    + (cursor_point - edge_point) * 0.5
+            } else {
+                let side_offset = if self.edge == Edge::Left { 1.0 } else { -1.0 };
+                edge_point
+                    + egui::vec2(pull_amount * side_offset, 0.0)
+                    + (cursor_point - edge_point) * 0.5
+            };
+
+            // Draw fluid droplets/particles along the bezier path
+            for i in 0..8 {
+                let t = (i as f32 / 8.0) * 0.7; // Only first 70% of path
+                let offset = i as f32 * 0.3;
+                let particle_pulse = (self.animation_time * 3.0 + offset).sin() * 0.5 + 0.5;
+
+                // Bezier position
+                let pos = edge_point * (1.0 - t).powi(2)
+                    + control_point.to_vec2() * (2.0 * (1.0 - t) * t)
+                    + cursor_point.to_vec2() * t.powi(2);
+
+                let particle_size = (8.0 + self.progress * 6.0) * (1.0 - t * 0.5) * particle_pulse;
+                let particle_alpha = self.progress * (1.0 - t * 0.6);
+
+                // Particle glow
+                painter.circle_filled(
+                    egui::pos2(pos.x, pos.y),
+                    particle_size * 1.5,
+                    egui::Color32::from_rgba_premultiplied(
+                        (100.0 * particle_alpha * 0.7) as u8,
+                        (140.0 * particle_alpha * 0.7) as u8,
+                        (255.0 * particle_alpha * 0.7) as u8,
+                        (50.0 * particle_alpha) as u8,
+                    ),
+                );
+
+                // Particle core
+                painter.circle_filled(
+                    egui::pos2(pos.x, pos.y),
+                    particle_size,
+                    egui::Color32::from_rgba_premultiplied(
+                        (180.0 * particle_alpha) as u8,
+                        (210.0 * particle_alpha) as u8,
+                        (255.0 * particle_alpha) as u8,
+                        (140.0 * particle_alpha) as u8,
+                    ),
+                );
+            }
+
+            // Main fluid portal at edge - stretched elliptical shape
+            let portal_base_size = 30.0 + self.progress * 40.0;
+
+            // Stretch factor based on pull direction
+            let stretch_major = portal_base_size * (1.5 + self.progress * 0.8) * pulse;
+            let stretch_minor = portal_base_size * (0.8 - self.progress * 0.2) * pulse;
+
+            // Draw stretched portal as ellipse
+            let portal_rect = if is_horizontal {
+                egui::Rect::from_center_size(
+                    edge_point,
+                    egui::vec2(stretch_major * 1.8, stretch_minor * 0.6),
+                )
+            } else {
+                egui::Rect::from_center_size(
+                    edge_point,
+                    egui::vec2(stretch_minor * 0.6, stretch_major * 1.8),
+                )
+            };
+
+            // Outermost fluid layer (very soft purple glow)
+            painter.rect_filled(
+                portal_rect,
+                portal_base_size,
+                egui::Color32::from_rgba_premultiplied(
+                    (100.0 * self.progress) as u8,
+                    (100.0 * self.progress) as u8,
+                    (200.0 * self.progress) as u8,
+                    (35.0 * self.progress) as u8,
+                ),
+            );
+
+            // Middle fluid layer (blue)
+            let mid_rect = if is_horizontal {
+                egui::Rect::from_center_size(
+                    edge_point,
+                    egui::vec2(stretch_major * 1.3, stretch_minor * 0.5),
+                )
+            } else {
+                egui::Rect::from_center_size(
+                    edge_point,
+                    egui::vec2(stretch_minor * 0.5, stretch_major * 1.3),
+                )
+            };
+            painter.rect_filled(
+                mid_rect,
+                portal_base_size * 0.8,
+                egui::Color32::from_rgba_premultiplied(
+                    (120.0 * self.progress) as u8,
+                    (160.0 * self.progress) as u8,
+                    (255.0 * self.progress) as u8,
+                    (90.0 * self.progress) as u8,
+                ),
+            );
+
+            // Inner bright core
+            let core_rect = if is_horizontal {
+                egui::Rect::from_center_size(
+                    edge_point,
+                    egui::vec2(stretch_major * 0.7, stretch_minor * 0.35),
+                )
+            } else {
+                egui::Rect::from_center_size(
+                    edge_point,
+                    egui::vec2(stretch_minor * 0.35, stretch_major * 0.7),
+                )
+            };
+            painter.rect_filled(
+                core_rect,
+                portal_base_size * 0.5,
+                egui::Color32::from_rgba_premultiplied(
+                    (200.0 * self.progress) as u8,
+                    (220.0 * self.progress) as u8,
+                    (255.0 * self.progress) as u8,
+                    (180.0 * self.progress) as u8,
+                ),
+            );
+
+            // Draw smooth fluid stream with bezier curve
+            let segments = 25;
+            for i in 0..segments {
+                let t = i as f32 / segments as f32;
+                let next_t = (i + 1) as f32 / segments as f32;
+
+                // Bezier curve points
+                let p1 = edge_point * (1.0 - t).powi(2)
+                    + control_point.to_vec2() * (2.0 * (1.0 - t) * t)
+                    + cursor_point.to_vec2() * t.powi(2);
+
+                let p2 = edge_point * (1.0 - next_t).powi(2)
+                    + control_point.to_vec2() * (2.0 * (1.0 - next_t) * next_t)
+                    + cursor_point.to_vec2() * next_t.powi(2);
+
+                // Width varies along curve for organic fluid look
+                let width_base = 1.0 - t * 0.6;
+                let width_variation = (self.animation_time * 4.0 + t * 8.0).sin() * 0.1 + 1.0;
+                let width_mult = width_base * width_variation;
+                let alpha_mult = 1.0 - t * 0.4;
+
+                // Outer fluid stream (soft glow)
+                let stream_width_outer = (9.0 + self.progress * 7.0) * width_mult;
+                painter.line_segment(
+                    [egui::pos2(p1.x, p1.y), egui::pos2(p2.x, p2.y)],
+                    egui::Stroke::new(
+                        stream_width_outer,
+                        egui::Color32::from_rgba_premultiplied(
+                            (100.0 * self.progress * alpha_mult) as u8,
+                            (140.0 * self.progress * alpha_mult) as u8,
+                            (255.0 * self.progress * alpha_mult) as u8,
+                            (50.0 * self.progress * alpha_mult) as u8,
+                        ),
+                    ),
+                );
+
+                // Inner fluid stream (bright core)
+                let stream_width_inner = (4.5 + self.progress * 3.5) * width_mult;
+                painter.line_segment(
+                    [egui::pos2(p1.x, p1.y), egui::pos2(p2.x, p2.y)],
+                    egui::Stroke::new(
+                        stream_width_inner,
+                        egui::Color32::from_rgba_premultiplied(
+                            (180.0 * self.progress * alpha_mult) as u8,
+                            (210.0 * self.progress * alpha_mult) as u8,
+                            (255.0 * self.progress * alpha_mult) as u8,
+                            (150.0 * self.progress * alpha_mult) as u8,
+                        ),
+                    ),
+                );
+            }
+        }
+
+        // Draw cursor with macOS-style appearance
+        // Soft outer glow when active
+        if self.progress > 0.1 {
+            let glow_radius = cursor_size + 8.0;
+            let cursor_glow = egui::Color32::from_rgba_premultiplied(
+                (100.0 * self.progress) as u8,
+                (140.0 * self.progress) as u8,
+                (255.0 * self.progress) as u8,
+                (40.0 * self.progress) as u8,
+            );
+            painter.circle_filled(cursor_point, glow_radius, cursor_glow);
+        }
+
+        // Shadow layer
+        let shadow_offset = egui::vec2(0.5, 1.5);
+        let shadow = egui::Color32::from_rgba_premultiplied(0, 0, 0, 120);
+        painter.circle_filled(cursor_point + shadow_offset, cursor_size + 1.0, shadow);
+
+        // Outer cursor ring (white)
+        painter.circle_filled(cursor_point, cursor_size, egui::Color32::WHITE);
+
+        // Inner cursor (dark gray/black with slight blue tint when active)
+        let cursor_inner_size = cursor_size - 2.2;
+        let cursor_inner = if self.progress > 0.1 {
+            egui::Color32::from_rgb(
+                (30.0 + 50.0 * self.progress) as u8,
+                (30.0 + 70.0 * self.progress) as u8,
+                (30.0 + 110.0 * self.progress) as u8,
+            )
+        } else {
+            egui::Color32::from_rgb(35, 35, 40)
+        };
+        painter.circle_filled(cursor_point, cursor_inner_size, cursor_inner);
+
+        // Highlight on cursor for 3D effect
+        let highlight_offset = egui::vec2(-cursor_size * 0.28, -cursor_size * 0.32);
+        let highlight_size = cursor_size * 0.4;
+        let highlight = egui::Color32::from_rgba_premultiplied(255, 255, 255, 170);
+        painter.circle_filled(cursor_point + highlight_offset, highlight_size, highlight);
 
         ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
 }

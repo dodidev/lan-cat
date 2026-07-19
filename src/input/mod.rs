@@ -343,8 +343,16 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         }
                     }
                     InputMessage::Leave => {
+                        let rejected_direct_enter =
+                            matches!(
+                                &outgoing,
+                                Some(Outgoing::Sending { peer: active, ready: false, .. }) if *active == peer
+                            );
                         if outgoing.as_ref().is_some_and(|value| outgoing_peer(value) == peer) {
                             outgoing = None;
+                            if rejected_direct_enter {
+                                confirmed_peers.remove(&peer);
+                            }
                             capture.release();
                         }
                         if incoming.as_ref().is_some_and(|value| value.peer == peer) {
