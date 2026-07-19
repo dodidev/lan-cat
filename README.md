@@ -2,42 +2,103 @@
 
 Secure, peer-to-peer clipboard sync and LAN file sharing for macOS and Linux Wayland desktops.
 
-## Current feature set
+## Overview
 
-- Peer-to-peer clipboard sync for text, HTML, RTF, PNG, and copied regular files.
-- Explicit LAN file sharing with peer selection, accept/reject, destination selection, progress,
-  transfer speed, cancellation, and safe `.part` writes.
-- Local file-copy confirmation popup for Finder/Thunar copy operations: **Normal copy only** by
-  default, or **Sync clipboard** when the copied files should be sent through clipboard sync.
-- Finder Quick Action on macOS and Thunar custom action on Linux for **Share with lan-cat**.
-- Manual-start user service support through `launchctl` on macOS and `systemd --user` on Linux.
-- LAN-only discovery through mDNS, with encrypted authenticated connections between trusted peers.
-- Opt-in macOS and Wayland cursor sharing on all four screen edges, including click, scroll, and drag.
+`lan-cat` provides seamless clipboard synchronization and file sharing between trusted devices on your local network. It uses modern cryptography (Noise protocol) to ensure security and privacy while maintaining a simple user experience.
 
-## Security model
+**Key principles:**
+- **Privacy-first**: No cloud, no accounts, no telemetry. All data stays on your LAN.
+- **Trust-based**: Explicit pairing with code confirmation. Only trusted peers can sync.
+- **Platform-native**: Direct integration with macOS NSPasteboard and Linux Wayland data-control.
+- **User-controlled**: Explicit confirmation for file transfers and cursor sharing.
 
-- Noise XX pairing with a code confirmed on both devices.
-- Noise KK authenticated encryption for every later connection.
-- Peer identity keys are pinned; unknown devices cannot sync.
-- Clipboard content is never written to config or logs. Received clipboard files use private
-  temporary directories so desktop apps can paste them; these are removed as they expire or the
-  daemon exits. Explicit file transfers use hidden `.part` files until acceptance and completion.
-- No cloud, account, relay, telemetry, or internet service.
+## Features
 
-`lan-cat` protects against LAN eavesdropping, tampering, and impersonation. It does not protect
-clipboard data from software already running as your local user.
+### Clipboard Synchronization
+- **Supported formats**: Text, HTML, RTF, PNG images, and copied regular files
+- **Real-time sync**: Automatic synchronization across all paired devices
+- **Conflict resolution**: Version vector clocks prevent clipboard loops and ensure causal consistency
+- **Size limits**: Up to 16 MB payloads, maximum 64 files per clipboard operation
+- **File handling**: Temporary materialized files for paste operations, automatic cleanup
 
-## Platform support
+### Explicit File Sharing
+- **GUI-based**: Select files and choose destination peer through native GUI
+- **Progress tracking**: Real-time transfer progress, speed, and estimated time
+- **Safe writes**: Files written to `.part` extensions during transfer, renamed on completion
+- **User consent**: Accept/reject transfers on receiving end with destination selection
+- **Cancellation**: Either side can cancel in-progress transfers
+- **Integration**: Finder Quick Action (macOS) and Thunar custom action (Linux)
+- **Drag-drop transfer**: POC support for dragging files between devices during input sharing (experimental)
 
-- macOS 13 or newer through `NSPasteboard`.
-- Wayland compositors implementing `ext-data-control-v1` or `wlr-data-control-v1`, including
-  KDE Plasma, Sway, Hyprland, niri, and similar compositors.
-- GNOME/Mutter is unsupported because it does not expose either background data-control protocol.
-- X11, copied directories, and SVG/TIFF/PDF rich clipboard formats are not supported. Any of those
-  formats can still sync when copied as a regular file.
+### Input Sharing (Opt-in)
+- **Cursor and keyboard**: Full mouse and keyboard control of remote device
+- **Edge-based**: Push cursor to screen edges to transfer input control
+- **Complete input**: Mouse movement, clicks, scrolling, drag operations, and keyboard typing
+- **Modifier keys**: Support for Shift, Control, Alt/Option, Command/Super keys
+- **Bidirectional**: Works on all four screen edges with visual feedback
+- **Beacon UI**: Shows edge detection progress and peer availability
+- **Platform support**: macOS (requires Accessibility permissions) and Wayland compositors
+- **Security**: Opt-in only due to remote input injection capability
 
-Linux integration uses Wayland protocols directly through `wl-clipboard-rs`; it prefers the modern
-`ext-data-control-v1` protocol and falls back to `wlr-data-control-v1`.
+### Service Management
+- **User services**: Manual-start services via `launchctl` (macOS) or `systemd --user` (Linux)
+- **Automatic restart**: Service restart on failure with 3-second delay
+- **Daemon mode**: Background process with IPC for CLI commands
+- **Status monitoring**: Real-time status checks and peer listing
+
+## Security Model
+
+### Cryptography
+- **Pairing**: Noise XX handshake with 6-digit authentication code confirmed on both devices
+- **Connections**: Noise KK authenticated encryption for all subsequent connections
+- **Identity**: X25519 key pairs, device IDs derived from public key BLAKE3 hash
+- **Key pinning**: Peer public keys stored in config; unknown devices rejected automatically
+
+### Privacy Guarantees
+- **No logging**: Clipboard content never written to logs or config files
+- **Temporary files**: Received clipboard files use private temporary directories (mode 0700)
+- **Cleanup**: Temporary files removed on expiration or daemon exit
+- **Safe transfers**: Explicit file transfers use hidden `.part` files until completion
+- **No network services**: No cloud, accounts, relays, telemetry, or internet connectivity
+
+### Threat Model
+- **Protects against**: LAN eavesdropping, packet tampering, device impersonation
+- **Does NOT protect against**: Malware or software running as your local user
+- **Trust boundary**: Clipboard data shared with explicitly paired devices only
+- **Configuration security**: Config stored at `~/.config/lan-cat/config.json` (mode 0600)
+
+### Protocol Details
+- **Version**: Protocol v4 (backward compatibility not guaranteed during development)
+- **Transport**: TCP with ChaCha20-Poly1305 AEAD encryption
+- **Discovery**: mDNS for LAN-only device discovery
+- **Message format**: CBOR serialization with length-prefixed framing
+
+## Platform Support
+
+### macOS
+- **Requirements**: macOS 13 (Ventura) or newer
+- **Clipboard backend**: `NSPasteboard` API via `objc2`
+- **Service manager**: `launchctl` user services
+- **File manager**: Finder Quick Actions (`.workflow` bundles)
+- **Input injection**: CoreGraphics events (cursor + keyboard), requires Accessibility permissions
+
+### Linux (Wayland)
+- **Requirements**: Wayland compositor with data-control protocol support
+- **Clipboard backend**: `wl-clipboard-rs` with protocol preference:
+  1. `ext-data-control-v1` (modern standard)
+  2. `wlr-data-control-v1` (wlroots fallback)
+- **Supported compositors**: KDE Plasma, Sway, Hyprland, niri, River, and similar
+- **Unsupported**: GNOME/Mutter (no background data-control protocol)
+- **Service manager**: `systemd --user` services
+- **File manager**: Thunar custom actions (XML-based)
+- **Input injection**: Virtual pointer and virtual keyboard protocols (zwlr/zwp)
+
+### Limitations
+- **No X11**: X11 clipboard backend not yet implemented (see TODO.md)
+- **No Windows**: Windows support planned but not implemented
+- **No directories**: Copied directories not supported (copy as archive file instead)
+- **Format restrictions**: SVG, TIFF, and PDF clipboard formats not supported
+  - Workaround: Copy these as regular files instead
 
 ## Install
 
@@ -88,16 +149,137 @@ lan-cat service install
 lan-cat service start
 ```
 
-Other commands:
+### Additional Commands
 
-```text
-lan-cat status
-lan-cat peers
-lan-cat pause
-lan-cat resume
-lan-cat unpair <peer-id-or-unique-prefix>
-lan-cat name set-name
-lan-cat share <file> [more-files...]
+**Status and peer management:**
+```sh
+lan-cat status                      # Show daemon status, platform info, and backend
+lan-cat peers                        # List all paired devices with IDs and names
+lan-cat name                         # Display current device name
+lan-cat name "My Laptop"             # Change device name
+lan-cat unpair <peer-id-prefix>      # Remove a paired peer
+```
+
+**Clipboard control:**
+```sh
+lan-cat pause                        # Pause synchronization (daemon keeps running)
+lan-cat resume                       # Resume synchronization from fresh baseline
+```
+
+**File sharing:**
+```sh
+lan-cat share file1.txt file2.pdf    # Open GUI to select peer and share files
+lan-cat share --peer <id> file.zip   # Share directly with specific peer
+lan-cat transfers                    # Open transfer history window
+```
+
+**Input sharing (cursor and keyboard):**
+```sh
+lan-cat cursor enable                # Enable input sharing on screen edges
+lan-cat cursor disable               # Disable input sharing
+lan-cat cursor status                # Show current input sharing configuration
+```
+
+**File manager integration:**
+```sh
+lan-cat integration install          # Install Finder/Thunar sharing action
+lan-cat integration uninstall        # Remove file manager integration
+```
+
+## Architecture
+
+### Components
+```
+┌─────────────────────────────────────────────────────────┐
+│                   CLI Commands                          │
+└───────────────────┬─────────────────────────────────────┘
+                    │ IPC (Unix socket)
+┌───────────────────▼─────────────────────────────────────┐
+│                    Daemon                               │
+│  ┌──────────────┬──────────────┬──────────────┐        │
+│  │  Clipboard   │   Network    │  Transfer    │        │
+│  │   Manager    │   Manager    │   Manager    │        │
+│  └──────┬───────┴──────┬───────┴──────┬───────┘        │
+│         │              │              │                 │
+│  ┌──────▼──────┐ ┌────▼────┐  ┌──────▼──────┐         │
+│  │  Backend    │ │  mDNS   │  │   Transfer  │         │
+│  │  (macOS/    │ │  Noise  │  │   Protocol  │         │
+│  │  Wayland)   │ │  TCP    │  │   (CBOR)    │         │
+│  └─────────────┘ └─────────┘  └─────────────┘         │
+└─────────────────────────────────────────────────────────┘
+         │                │                │
+┌────────▼────────┐ ┌─────▼──────┐ ┌──────▼────────┐
+│  NSPasteboard/  │ │  Network   │ │  Filesystem   │
+│  data-control   │ │    (LAN)   │ │  (transfers)  │
+└─────────────────┘ └────────────┘ └───────────────┘
+```
+
+### Module Overview
+- **`main.rs`**: CLI argument parsing and command dispatch
+- **`daemon.rs`**: Main event loop, coordinates clipboard/network/transfer managers
+- **`config.rs`**: Configuration persistence, key management
+- **`network.rs`**: mDNS discovery, Noise handshakes, secure connections
+- **`protocol.rs`**: Message types, clipboard payload validation
+- **`clipboard/`**: Platform-specific clipboard backends (macOS, Wayland)
+- **`transfer/`**: File transfer protocol, progress tracking
+- **`input/`**: Input sharing implementation - cursor and keyboard (platform-specific)
+- **`ipc.rs`**: Unix socket IPC between CLI and daemon
+- **`ordering.rs`**: Version vector clocks for causal consistency
+- **`gui.rs`**: Native GUI windows for file sharing and transfers
+- **`integration.rs`**: File manager integration installation
+- **`service.rs`**: System service installation and management
+
+### Data Flow
+1. **Clipboard change** detected by platform backend
+2. **Payload extracted** and validated against size/format limits
+3. **Version vector** incremented for causal ordering
+4. **ClipboardEvent** broadcast to all active peer connections
+5. **Receiving peers** compare version vectors
+6. **Remote payload** applied to local clipboard if causally newer
+7. **Duplicate suppression** prevents sync loops
+
+### Configuration
+- **Location**: `~/.config/lan-cat/config.json` (Linux/macOS)
+- **Permissions**: Mode 0600 (private to user)
+- **Contents**:
+  - Version and device name
+  - X25519 private/public key pair
+  - Trusted peer database (ID → name, public key)
+  - Pause state and cursor settings
+  - Version vector clock state
+
+## Development
+
+### Build Requirements
+- **Rust**: Edition 2024, MSRV 1.85
+- **macOS**: Xcode command line tools
+- **Linux**: Wayland development libraries
+
+### Dependencies
+- **Crypto**: `snow`, `blake3`, `chacha20poly1305`, `x25519-dalek`
+- **Async**: `tokio` (full features)
+- **Network**: `mdns-sd` for discovery
+- **GUI**: `eframe` with Wayland/X11/macOS backends
+- **Platform**: `objc2` (macOS), `wl-clipboard-rs` (Linux)
+
+### Testing
+```sh
+cargo test
+cargo build --release
+```
+
+### Debugging
+```sh
+# Enable trace logging
+export RUST_LOG=lan_cat=trace
+lan-cat daemon
+
+# Check service status
+lan-cat service status
+
+# View config
+cat ~/.config/lan-cat/config.json
+```
 lan-cat transfers
 lan-cat cursor enable
 lan-cat cursor disable
@@ -129,11 +311,21 @@ The config contains the local X25519 private/public key pair, device name, pause
 clock, and pinned peer public keys. Clipboard contents and transfer payloads are not stored there.
 On Unix, the config directory is set to `0700` and the config file is set to `0600`.
 
+`lan-cat name` prints the current device name. `lan-cat name <new-device-name>` stores a printable
+1..63 character name used for discovery and peer lists.
+
 Service files are installed to:
 
 ```text
 macOS: ~/Library/Application Support/org.lan-cat.lan-cat/org.lan-cat.daemon.plist
 Linux: ~/.config/systemd/user/lan-cat.service
+```
+
+The daemon IPC socket is local-user only:
+
+```text
+macOS: ~/Library/Caches/org.lan-cat.lan-cat/lan-cat.sock
+Linux: $XDG_RUNTIME_DIR/lan-cat.sock, or ~/.cache/lan-cat/lan-cat.sock when unset
 ```
 
 Integration files are installed to:
