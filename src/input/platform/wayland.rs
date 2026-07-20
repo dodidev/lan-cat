@@ -488,10 +488,38 @@ impl CaptureState {
         }
         self.current_edge = Some(edge);
         self.active.store(true, Ordering::Release);
+        
+        // Estimate screen dimensions from configured layers
+        let (screen_width, screen_height) = self.estimate_screen_dimensions();
+        
         let _ = self.events.send(CaptureEvent::Begin {
             edge,
             position: self.position,
+            screen_width,
+            screen_height,
         });
+    }
+    
+    fn estimate_screen_dimensions(&self) -> (f64, f64) {
+        // Get the largest width and height from all configured layers
+        let mut max_width = 0;
+        let mut max_height = 0;
+        for layer in &self.layers {
+            if layer.configured {
+                match layer.edge {
+                    Edge::Left | Edge::Right => {
+                        max_height = max_height.max(layer.height);
+                    }
+                    Edge::Top | Edge::Bottom => {
+                        max_width = max_width.max(layer.width);
+                    }
+                }
+            }
+        }
+        // If no layers configured, use reasonable defaults (HD resolution)
+        let width = if max_width > 0 { max_width } else { 1920 };
+        let height = if max_height > 0 { max_height } else { 1080 };
+        (width as f64, height as f64)
     }
 }
 

@@ -92,6 +92,8 @@ pub enum InputMessage {
     Enter {
         edge: Edge,
         position: f64,
+        screen_width: f64,
+        screen_height: f64,
     },
     Ack,
     Leave,
@@ -115,8 +117,10 @@ impl InputMessage {
             {
                 bail!("invalid cursor probe")
             }
-            Self::Enter { position, .. }
-                if !position.is_finite() || !(0.0..=1.0).contains(&position) =>
+            Self::Enter { position, screen_width, screen_height, .. }
+                if !position.is_finite() || !(0.0..=1.0).contains(&position)
+                    || !screen_width.is_finite() || screen_width <= 0.0
+                    || !screen_height.is_finite() || screen_height <= 0.0 =>
             {
                 bail!("invalid cursor entry")
             }

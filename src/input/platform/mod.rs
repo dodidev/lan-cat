@@ -4,7 +4,7 @@ mod macos;
 mod wayland;
 
 #[cfg(target_os = "macos")]
-pub use macos::{Capture, Injector};
+pub use macos::{Capture, Injector, screen_dimensions};
 #[cfg(target_os = "linux")]
 pub use wayland::{Capture, Injector};
 
@@ -18,7 +18,12 @@ pub(super) fn edge_mask(edge: Edge) -> u8 {
 
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureEvent {
-    Begin { edge: Edge, position: f64 },
+    Begin {
+        edge: Edge,
+        position: f64,
+        screen_width: f64,
+        screen_height: f64,
+    },
     Pointer(PointerInput),
     Keyboard(KeyboardInput),
     LocalInput,

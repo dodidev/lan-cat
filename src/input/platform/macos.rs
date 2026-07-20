@@ -280,7 +280,13 @@ unsafe extern "C" fn callback(
             unsafe {
                 CGDisplayHideCursor(CGMainDisplayID());
             }
-            let _ = state.events.send(CaptureEvent::Begin { edge, position });
+            let (screen_width, screen_height) = screen_dimensions();
+            let _ = state.events.send(CaptureEvent::Begin {
+                edge,
+                position,
+                screen_width,
+                screen_height,
+            });
             return ptr::null_mut();
         }
     }
@@ -506,6 +512,12 @@ fn edge_point(edge: Edge, position: f64, inset: f64) -> CGPoint {
 fn display_bounds() -> CGRect {
     unsafe { CGDisplayBounds(CGMainDisplayID()) }
 }
+
+pub fn screen_dimensions() -> (f64, f64) {
+    let bounds = display_bounds();
+    (bounds.size.width, bounds.size.height)
+}
+
 fn is_motion(event: u32) -> bool {
     matches!(
         event,

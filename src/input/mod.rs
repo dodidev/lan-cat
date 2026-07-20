@@ -15,8 +15,21 @@ use tokio::sync::RwLock;
 use crate::config::Config;
 use beacon::Beacon;
 use platform::{Capture, CaptureEvent, Injector};
-use protocol::{Edge, InputMessage};
+use protocol::{Edge, InputMessage, PointerInput};
 use transport::{Inbound, Outbound};
+
+// Screen dimensions getter - different implementations per platform
+#[cfg(target_os = "macos")]
+fn get_local_screen_dimensions() -> (f64, f64) {
+    platform::screen_dimensions()
+}
+
+#[cfg(target_os = "linux")]
+fn get_local_screen_dimensions() -> (f64, f64) {
+    // For Wayland injector, screen size is not as critical since we use
+    // normalized coordinates, but we'll use a default for consistency
+    (1920.0, 1080.0)
+}
 
 const CONFIRM_TIME: Duration = Duration::from_secs(2);
 const PRESS_GAP: Duration = Duration::from_millis(280);
@@ -37,6 +50,8 @@ enum Outgoing {
         started: Instant,
         last_push: Instant,
         acknowledged: bool,
+        screen_width: f64,
+        screen_height: f64,
     },
     Sending {
         peer: String,
@@ -49,6 +64,8 @@ enum Outgoing {
 struct Incoming {
     peer: String,
     edge: Edge,
+    peer_screen_width: f64,
+    peer_screen_height: f64,
 }
 
 struct Preview {
@@ -124,7 +141,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                     anyhow::bail!("cursor capture stopped")
                 };
                 match event {
-                    CaptureEvent::Begin { edge, position } => {
+                    CaptureEvent::Begin { edge, position, screen_width, screen_height } => {
                         if incoming.as_ref().is_some_and(|active| active.edge == edge) {
                             let active = incoming.take().expect("incoming cursor");
                             injector.end()?;
@@ -158,7 +175,12 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             send(
                                 &outbound,
                                 peer.clone(),
-                                InputMessage::Enter { edge: edge.opposite(), position },
+                                InputMessage::Enter {
+                                    edge: edge.opposite(),
+                                    position,
+                                    screen_width,
+                                    screen_height,
+                                },
                             )?;
                             outgoing = Some(Outgoing::Sending {
                                 peer,
@@ -176,6 +198,8 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             started: now,
                             last_push: now,
                             acknowledged: false,
+                            screen_width,
+                            screen_height,
                         });
                         send_probe(&outbound, peer, edge, position, 0.0)?;
                     }
@@ -283,7 +307,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             if let Some(mut value) = preview.take() { value.beacon.cancel(); }
                         }
                     }
-                    InputMessage::Enter { edge, position } => {
+                    InputMessage::Enter { edge, position, screen_width, screen_height } => {
                         if takeover.as_ref().is_some_and(|(active, started, _)| {
                             *active == peer && started.elapsed() <= TAKEOVER_REPEAT_TIME
                         }) {
@@ -322,7 +346,12 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         }
                         portal_edges.entry(peer.clone()).or_insert(edge);
                         confirmed_peers.insert(peer.clone());
-                        incoming = Some(Incoming { peer: peer.clone(), edge });
+                        incoming = Some(Incoming {
+                            peer: peer.clone(),
+                            edge,
+                            peer_screen_width: screen_width,
+                            peer_screen_height: screen_height,
+                        });
                         send(&outbound, peer, InputMessage::Ack)?;
                     }
                     InputMessage::Ack => {
@@ -367,8 +396,23 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         });
                         if takeover_active {
                             send_force_leave(&outbound, peer)?;
-                        } else if incoming.as_ref().is_some_and(|value| value.peer == peer) {
-                            injector.apply(pointer)?;
+                        } else if let Some(incoming_state) = &incoming {
+                            if incoming_state.peer == peer {
+                                // Scale pointer motion based on screen dimensions
+                                let scaled_pointer = match pointer {
+                                    PointerInput::Motion { dx, dy } => {
+                                        let (local_width, local_height) = get_local_screen_dimensions();
+                                        let scale_x = local_width / incoming_state.peer_screen_width;
+                                        let scale_y = local_height / incoming_state.peer_screen_height;
+                                        PointerInput::Motion {
+                                            dx: dx * scale_x,
+                                            dy: dy * scale_y,
+                                        }
+                                    }
+                                    other => other,
+                                };
+                                injector.apply(scaled_pointer)?;
+                            }
                         }
                     }
                     InputMessage::Keyboard(keyboard) => {
@@ -434,11 +478,11 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                 }
                 let mut confirm = None;
                 let mut cancel = None;
-                if let Some(Outgoing::Probing { peer, edge, position, started, last_push, acknowledged }) = &outgoing {
+                if let Some(Outgoing::Probing { peer, edge, position, started, last_push, acknowledged, screen_width, screen_height }) = &outgoing {
                     if last_push.elapsed() > PRESS_GAP {
                         cancel = Some(peer.clone());
                     } else if *acknowledged && started.elapsed() >= CONFIRM_TIME {
-                        confirm = Some((peer.clone(), *edge, *position));
+                        confirm = Some((peer.clone(), *edge, *position, *screen_width, *screen_height));
                     }
                 }
                 if let Some(peer) = cancel {
@@ -446,13 +490,15 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                     outgoing = None;
                     capture.release();
                 }
-                if let Some((peer, edge, position)) = confirm {
+                if let Some((peer, edge, position, screen_width, screen_height)) = confirm {
                     send(
                         &outbound,
                         peer.clone(),
                         InputMessage::Enter {
                             edge: edge.opposite(),
                             position,
+                            screen_width,
+                            screen_height,
                         },
                     )?;
                     outgoing = Some(Outgoing::Sending {
