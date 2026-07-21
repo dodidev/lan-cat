@@ -90,7 +90,6 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
     let mut incoming: Option<Incoming> = None;
     let mut preview: Option<Preview> = None;
     let mut takeover: Option<(String, Instant, Instant)> = None;
-    let mut confirmed_peers = HashSet::new();
     let mut portal_edges: HashMap<String, HashSet<Edge>> = HashMap::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -133,9 +132,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             capture.release();
                             continue;
                         };
-                        if confirmed_peers.contains(&peer)
-                            && portal_edge_confirmed(&portal_edges, &peer, edge)
-                        {
+                        if portal_edge_confirmed(&portal_edges, &peer, edge) {
                             send(
                                 &outbound,
                                 peer.clone(),
@@ -244,9 +241,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 continue;
                             }
                             // Confirmed peers may enter directly; do not replay the portal UI.
-                            if confirmed_peers.contains(&peer)
-                                && portal_edge_confirmed(&portal_edges, &peer, edge)
-                            {
+                            if portal_edge_confirmed(&portal_edges, &peer, edge) {
                                 send(&outbound, peer, InputMessage::ProbeAck)?;
                                 continue;
                             }
@@ -293,8 +288,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 && value.last_probe.elapsed() <= PRESS_GAP
                         });
                         let outgoing_wins = outgoing.is_some() && local_id > peer;
-                        let confirmed_portal = confirmed_peers.contains(&peer)
-                            && portal_edge_confirmed(&portal_edges, &peer, edge);
+                        let confirmed_portal = portal_edge_confirmed(&portal_edges, &peer, edge);
                         let edge_available = portal_edge_available(&portal_edges, &peer, edge);
                         if !edge_available
                             || (!preview_matches && !confirmed_portal)
@@ -322,7 +316,6 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         capture.set_allowed_edge(Some(edge));
                         injector.begin(edge, position)?;
                         portal_edges.entry(peer.clone()).or_default().insert(edge);
-                        confirmed_peers.insert(peer.clone());
                         incoming = Some(Incoming {
                             peer: peer.clone(),
                             edge,
@@ -345,20 +338,23 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 *ready = true;
                                 tracing::debug!(%peer, source_edge = %edge, "cursor entry acknowledged");
                                 portal_edges.entry(peer.clone()).or_default().insert(*edge);
-                                confirmed_peers.insert(peer);
                             }
                         }
                     }
                     InputMessage::Leave => {
-                        let rejected_direct_enter =
-                            matches!(
-                                &outgoing,
-                                Some(Outgoing::Sending { peer: active, ready: false, .. }) if *active == peer
-                            );
+                        let rejected_direct_edge = match &outgoing {
+                            Some(Outgoing::Sending {
+                                peer: active,
+                                edge,
+                                ready: false,
+                                ..
+                            }) if *active == peer => Some(*edge),
+                            _ => None,
+                        };
                         if outgoing.as_ref().is_some_and(|value| outgoing_peer(value) == peer) {
                             outgoing = None;
-                            if rejected_direct_enter {
-                                confirmed_peers.remove(&peer);
+                            if let Some(edge) = rejected_direct_edge {
+                                forget_portal_edge(&mut portal_edges, &peer, edge);
                             }
                             capture.release();
                         }
@@ -440,7 +436,6 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                     injector.end()?;
                     capture.allow_all_edges();
                 }
-                confirmed_peers.retain(|peer| trusted_peers.contains(peer));
                 portal_edges.retain(|peer, _| trusted_peers.contains(peer));
                 if last_ping.elapsed() >= Duration::from_millis(500) {
                     for peer in &trusted_peers {
@@ -502,7 +497,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                     if peer_timed_out(&last_seen, peer) {
                         let peer = peer.to_owned();
                         outgoing = None;
-                        confirmed_peers.remove(&peer);
+                        portal_edges.remove(&peer);
                         capture.release();
                         takeover = Some((peer.clone(), Instant::now(), Instant::now()));
                         send_force_leave(&outbound, peer)?;
@@ -510,7 +505,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                 }
                 if incoming.as_ref().is_some_and(|value| peer_timed_out(&last_seen, &value.peer)) {
                     if let Some(active) = incoming.take() {
-                        confirmed_peers.remove(&active.peer);
+                        portal_edges.remove(&active.peer);
                         takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
                         send_force_leave(&outbound, active.peer)?;
                     }
@@ -589,6 +584,16 @@ fn portal_edge_confirmed(
     portal_edges
         .get(peer)
         .is_some_and(|edges| edges.contains(&edge))
+}
+
+fn forget_portal_edge(portal_edges: &mut HashMap<String, HashSet<Edge>>, peer: &str, edge: Edge) {
+    let remove_peer = portal_edges.get_mut(peer).is_some_and(|edges| {
+        edges.remove(&edge);
+        edges.is_empty()
+    });
+    if remove_peer {
+        portal_edges.remove(peer);
+    }
 }
 
 fn pressure(edge: Edge, pointer: protocol::PointerInput) -> Option<(f64, f64)> {
@@ -786,10 +791,7 @@ mod tests {
 
     #[test]
     fn portal_binding_allows_same_peer_on_every_unclaimed_edge() {
-        let mut portal_edges = HashMap::from([(
-            "peer".to_owned(),
-            HashSet::from([Edge::Right]),
-        )]);
+        let mut portal_edges = HashMap::from([("peer".to_owned(), HashSet::from([Edge::Right]))]);
         assert!(portal_edge_confirmed(&portal_edges, "peer", Edge::Right));
         assert!(!portal_edge_confirmed(&portal_edges, "peer", Edge::Left));
         assert!(portal_edge_available(&portal_edges, "peer", Edge::Right));
@@ -807,6 +809,14 @@ mod tests {
             .insert(Edge::Top);
         assert!(portal_edge_confirmed(&portal_edges, "peer", Edge::Right));
         assert!(portal_edge_confirmed(&portal_edges, "peer", Edge::Top));
+
+        forget_portal_edge(&mut portal_edges, "peer", Edge::Right);
+        assert!(!portal_edge_confirmed(&portal_edges, "peer", Edge::Right));
+        assert!(portal_edge_confirmed(&portal_edges, "peer", Edge::Top));
+        assert!(portal_edge_available(&portal_edges, "peer", Edge::Bottom));
+
+        forget_portal_edge(&mut portal_edges, "peer", Edge::Top);
+        assert!(!portal_edges.contains_key("peer"));
     }
 
     #[test]
