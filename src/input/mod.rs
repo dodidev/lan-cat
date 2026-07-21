@@ -19,7 +19,7 @@ use protocol::{Edge, InputMessage, PointerInput};
 use transport::{Inbound, Outbound};
 
 const CONFIRM_TIME: Duration = Duration::from_secs(2);
-const PRESS_GAP: Duration = Duration::from_millis(280);
+const PRESS_GAP: Duration = Duration::from_millis(500);
 const PEER_TIMEOUT: Duration = Duration::from_millis(1_200);
 const TAKEOVER_REPEAT_TIME: Duration = Duration::from_millis(700);
 const TAKEOVER_REPEAT_GAP: Duration = Duration::from_millis(70);
@@ -61,7 +61,6 @@ struct Preview {
     peer: String,
     edge: Edge,
     last_probe: Instant,
-    progress: f32,
     beacon: Beacon,
 }
 
@@ -139,7 +138,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 &outbound,
                                 peer.clone(),
                                 InputMessage::Enter {
-                                    edge: edge.opposite(),
+                                    edge: destination_edge(edge),
                                     position,
                                     screen_width,
                                     screen_height,
@@ -255,13 +254,11 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 peer: peer.clone(),
                                 edge,
                                 last_probe: Instant::now(),
-                                progress,
                                 beacon: Beacon::show(edge, position, &peer)?,
                             });
                         }
                         if let Some(value) = &mut preview {
                             value.last_probe = Instant::now();
-                            value.progress = progress;
                             value.beacon.update(position, progress, false);
                         }
                         send(&outbound, peer, InputMessage::ProbeAck)?;
@@ -290,17 +287,27 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         let preview_matches = preview.as_ref().is_some_and(|value| {
                             value.peer == peer
                                 && value.edge == edge
-                                && value.progress >= 0.9
                                 && value.last_probe.elapsed() <= PRESS_GAP
                         });
                         let outgoing_wins = outgoing.is_some() && local_id > peer;
                         let confirmed_portal = confirmed_peers.contains(&peer)
                             && portal_edges.get(&peer) == Some(&edge);
-                        if !portal_edge_available(&portal_edges, &peer, edge)
+                        let edge_available = portal_edge_available(&portal_edges, &peer, edge);
+                        if !edge_available
                             || (!preview_matches && !confirmed_portal)
                             || incoming.is_some()
                             || outgoing_wins
                         {
+                            tracing::debug!(
+                                %peer,
+                                %edge,
+                                edge_available,
+                                preview_matches,
+                                confirmed_portal,
+                                incoming_active = incoming.is_some(),
+                                outgoing_wins,
+                                "cursor entry rejected"
+                            );
                             send_force_leave(&outbound, peer)?;
                             continue;
                         }
@@ -321,6 +328,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             peer_screen_width: screen_width,
                             peer_screen_height: screen_height,
                         });
+                        tracing::debug!(%peer, %edge, "cursor entry accepted");
                         send(&outbound, peer, InputMessage::Ack)?;
                     }
                     InputMessage::Ack => {
@@ -332,6 +340,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         }) = &mut outgoing {
                             if *active == peer {
                                 *ready = true;
+                                tracing::debug!(%peer, source_edge = %edge, "cursor entry acknowledged");
                                 portal_edges.entry(peer.clone()).or_insert(*edge);
                                 confirmed_peers.insert(peer);
                             }
@@ -464,11 +473,12 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                     capture.release();
                 }
                 if let Some((peer, edge, position, screen_width, screen_height)) = confirm {
+                    tracing::debug!(%peer, source_edge = %edge, destination_edge = %destination_edge(edge), "cursor handshake confirmed");
                     send(
                         &outbound,
                         peer.clone(),
                         InputMessage::Enter {
-                            edge: edge.opposite(),
+                            edge: destination_edge(edge),
                             position,
                             screen_width,
                             screen_height,
@@ -617,11 +627,15 @@ fn send_probe(
         sender,
         peer,
         InputMessage::Probe {
-            edge: source_edge.opposite(),
+            edge: destination_edge(source_edge),
             position,
             progress,
         },
     )
+}
+
+fn destination_edge(source_edge: Edge) -> Edge {
+    source_edge.opposite()
 }
 
 fn send_force_leave(
@@ -669,6 +683,30 @@ mod tests {
             pressure(Edge::Bottom, PointerInput::Motion { dx: 20.0, dy: 4.0 }),
             Some((4.0, 0.02))
         );
+    }
+
+    #[test]
+    fn every_source_edge_maps_to_destination_opposite_edge() {
+        for (source, destination) in [
+            (Edge::Left, Edge::Right),
+            (Edge::Right, Edge::Left),
+            (Edge::Top, Edge::Bottom),
+            (Edge::Bottom, Edge::Top),
+        ] {
+            assert_eq!(destination_edge(source), destination);
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            send_probe(&tx, "peer".to_owned(), source, 0.5, 0.75).unwrap();
+            let outbound = rx.try_recv().unwrap();
+            assert_eq!(
+                outbound.message,
+                InputMessage::Probe {
+                    edge: destination,
+                    position: 0.5,
+                    progress: 0.75,
+                }
+            );
+        }
     }
 
     #[test]
