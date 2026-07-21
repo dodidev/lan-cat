@@ -64,6 +64,8 @@ enum Outgoing {
 struct Incoming {
     peer: String,
     edge: Edge,
+    #[cfg(target_os = "linux")]
+    depth: f64,
     peer_screen_width: f64,
     peer_screen_height: f64,
 }
@@ -349,6 +351,8 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         incoming = Some(Incoming {
                             peer: peer.clone(),
                             edge,
+                            #[cfg(target_os = "linux")]
+                            depth: REMOTE_ENTRY_INSET,
                             peer_screen_width: screen_width,
                             peer_screen_height: screen_height,
                         });
@@ -396,7 +400,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         });
                         if takeover_active {
                             send_force_leave(&outbound, peer)?;
-                        } else if let Some(incoming_state) = &incoming {
+                        } else if let Some(incoming_state) = &mut incoming {
                             if incoming_state.peer == peer {
                                 // Scale pointer motion based on screen dimensions
                                 let scaled_pointer = match pointer {
@@ -412,6 +416,23 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                     other => other,
                                 };
                                 injector.apply(scaled_pointer)?;
+                                #[cfg(target_os = "macos")]
+                                let left_remote = injector.left_entry_edge(
+                                    incoming_state.edge,
+                                    scaled_pointer,
+                                );
+                                #[cfg(target_os = "linux")]
+                                let left_remote = crosses_remote_entry_edge(
+                                    incoming_state.edge,
+                                    scaled_pointer,
+                                    &mut incoming_state.depth,
+                                );
+                                if left_remote {
+                                    injector.end()?;
+                                    capture.set_allowed_edge(None);
+                                    incoming = None;
+                                    send(&outbound, peer, InputMessage::Leave)?;
+                                }
                             }
                         }
                     }
@@ -611,6 +632,14 @@ fn crosses_host_edge(edge: Edge, pointer: protocol::PointerInput, depth: &mut f6
     *depth <= 0.0
 }
 
+fn crosses_remote_entry_edge(
+    entry_edge: Edge,
+    pointer: protocol::PointerInput,
+    depth: &mut f64,
+) -> bool {
+    crosses_host_edge(entry_edge.opposite(), pointer, depth)
+}
+
 fn send_probe(
     sender: &tokio::sync::mpsc::UnboundedSender<Outbound>,
     peer: String,
@@ -710,6 +739,28 @@ mod tests {
             &mut depth,
         ));
         assert_eq!(depth, REMOTE_ENTRY_INSET);
+    }
+
+    #[test]
+    fn remote_entry_edge_returns_to_controller() {
+        let mut depth = REMOTE_ENTRY_INSET;
+        assert!(!crosses_remote_entry_edge(
+            Edge::Left,
+            PointerInput::Motion { dx: 20.0, dy: 0.0 },
+            &mut depth,
+        ));
+        assert_eq!(depth, 23.0);
+        assert!(!crosses_remote_entry_edge(
+            Edge::Left,
+            PointerInput::Motion { dx: -10.0, dy: 0.0 },
+            &mut depth,
+        ));
+        assert_eq!(depth, 13.0);
+        assert!(crosses_remote_entry_edge(
+            Edge::Left,
+            PointerInput::Motion { dx: -14.0, dy: 0.0 },
+            &mut depth,
+        ));
     }
 
     #[test]

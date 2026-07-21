@@ -168,7 +168,7 @@ impl Capture {
             return;
         }
         state.active = false;
-        let point = edge_point(state.edge, state.position, 3.0);
+        let point = edge_point(state.edge, state.position, 20.0);
         unsafe {
             CGDisplayShowCursor(CGMainDisplayID());
             CGWarpMouseCursorPosition(point);
@@ -385,14 +385,15 @@ pub struct Injector {
 impl Injector {
     pub async fn new() -> Result<Self> {
         Ok(Self {
-            point: edge_point(Edge::Left, 0.5, 3.0),
+            point: edge_point(Edge::Left, 0.5, 20.0),
             buttons: 0,
             held_keys: Vec::new(),
         })
     }
 
     pub fn begin(&mut self, edge: Edge, position: f64) -> Result<()> {
-        self.point = edge_point(edge, position, 3.0);
+        // Use larger inset to give cursor room to move in both directions
+        self.point = edge_point(edge, position, 20.0);
         unsafe {
             CGWarpMouseCursorPosition(self.point);
         }
@@ -403,10 +404,12 @@ impl Injector {
         match input {
             PointerInput::Motion { dx, dy } => {
                 let bounds = display_bounds();
+                // Allow cursor to move very close to edges (within 0.5 pixels) to enable exit detection
+                // while still preventing it from going completely off-screen
                 self.point.x = (self.point.x + dx)
-                    .clamp(bounds.origin.x, bounds.origin.x + bounds.size.width - 1.0);
+                    .clamp(bounds.origin.x - 0.5, bounds.origin.x + bounds.size.width + 0.5);
                 self.point.y = (self.point.y + dy)
-                    .clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0);
+                    .clamp(bounds.origin.y - 0.5, bounds.origin.y + bounds.size.height + 0.5);
                 let event_type = if self.buttons & 1 != 0 {
                     LEFT_DRAGGED
                 } else if self.buttons & 2 != 0 {
@@ -450,6 +453,19 @@ impl Injector {
             post_key(key, false)?;
         }
         Ok(())
+    }
+
+    pub fn left_entry_edge(&self, edge: Edge, input: PointerInput) -> bool {
+        let PointerInput::Motion { dx, dy } = input else {
+            return false;
+        };
+        let bounds = display_bounds();
+        match edge {
+            Edge::Left => dx < 0.0 && self.point.x <= bounds.origin.x + 0.5,
+            Edge::Right => dx > 0.0 && self.point.x >= bounds.origin.x + bounds.size.width - 0.5,
+            Edge::Top => dy < 0.0 && self.point.y <= bounds.origin.y + 0.5,
+            Edge::Bottom => dy > 0.0 && self.point.y >= bounds.origin.y + bounds.size.height - 0.5,
+        }
     }
 
     pub fn apply_keyboard(&mut self, input: KeyboardInput) -> Result<()> {
@@ -800,5 +816,23 @@ mod tests {
         assert_eq!(delta_field(0.2), 1);
         assert_eq!(delta_field(-0.2), -1);
         assert_eq!(delta_field(0.0), 0);
+    }
+
+    #[test]
+    fn left_edge_entry_allows_right_motion() {
+        let bounds = display_bounds();
+        let injector = Injector {
+            point: CGPoint {
+                x: bounds.origin.x + 20.0,
+                y: bounds.origin.y + 20.0,
+            },
+            buttons: 0,
+            held_keys: Vec::new(),
+        };
+
+        assert!(!injector.left_entry_edge(
+            Edge::Left,
+            PointerInput::Motion { dx: 5.0, dy: 0.0 },
+        ));
     }
 }
