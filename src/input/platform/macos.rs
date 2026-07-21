@@ -404,9 +404,10 @@ impl Injector {
     pub fn begin(&mut self, edge: Edge, position: f64) -> Result<()> {
         // Use larger inset to give cursor room to move in both directions
         self.point = edge_point(edge, position, 20.0);
-        unsafe {
-            CGWarpMouseCursorPosition(self.point);
-        }
+        // Do not use CGWarpMouseCursorPosition here. Its generated motion is
+        // untagged, so our event tap mistakes remote entry for physical local
+        // input and immediately cancels the incoming session. The posted event
+        // carries SYNTHETIC_EVENT_TAG and moves the cursor to the same point.
         post_mouse(MOUSE_MOVED, self.point, 0)
     }
 
