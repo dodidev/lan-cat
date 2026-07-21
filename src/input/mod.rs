@@ -643,6 +643,7 @@ fn crosses_host_edge(edge: Edge, pointer: protocol::PointerInput, depth: &mut f6
     *depth <= 0.0
 }
 
+#[cfg(target_os = "linux")]
 fn crosses_remote_entry_edge(
     entry_edge: Edge,
     pointer: protocol::PointerInput,
@@ -794,6 +795,7 @@ mod tests {
         assert_eq!(depth, REMOTE_ENTRY_INSET);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn remote_entry_edge_returns_to_controller() {
         let mut depth = REMOTE_ENTRY_INSET;
