@@ -522,7 +522,7 @@ impl CaptureState {
             layer.wl_surface(),
             pointer,
             None,
-            wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime::Oneshot,
+            wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime::Persistent,
             qh,
         ) else {
             return;

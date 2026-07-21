@@ -4,7 +4,7 @@ mod macos;
 mod wayland;
 
 #[cfg(target_os = "macos")]
-pub use macos::{Capture, Injector, screen_dimensions};
+pub use macos::{Capture, Injector};
 #[cfg(target_os = "linux")]
 pub use wayland::{Capture, Injector};
 
@@ -28,5 +28,6 @@ pub enum CaptureEvent {
     Keyboard(KeyboardInput),
     LocalInput,
     LocalKeyboard(KeyboardInput),
+    #[cfg(target_os = "linux")]
     CaptureLost,
 }
