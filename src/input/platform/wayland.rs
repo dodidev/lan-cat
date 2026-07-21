@@ -311,7 +311,6 @@ struct CaptureState {
     position: f64,
     pending_edge: Option<Edge>,
     locked_edge: Option<Edge>,
-    capture_requested: bool,
     current_edge: Option<Edge>,
     active: Arc<AtomicBool>,
     allowed_edges: Arc<AtomicU8>,
@@ -401,7 +400,6 @@ fn run_capture(
         position: 0.5,
         pending_edge: None,
         locked_edge: None,
-        capture_requested: false,
         current_edge: None,
         active,
         allowed_edges,
@@ -529,6 +527,10 @@ impl CaptureState {
         };
         self.locked_pointer = Some(lock);
         self.pending_edge = Some(edge);
+        // Pointer-constraint activation events are not delivered consistently
+        // by every compositor. A successful request while the edge owns focus
+        // is enough to start capture; a later `unlocked` event still cancels it.
+        self.locked_edge = Some(edge);
         // Pointer-constraint activation depends on committed surface state.
         // Commit after creating the constraint so the compositor can activate
         // it while this edge surface still owns pointer focus.
@@ -573,7 +575,6 @@ impl CaptureState {
     fn reset_lock(&mut self) {
         self.pending_edge = None;
         self.locked_edge = None;
-        self.capture_requested = false;
         if let Some(lock) = self.locked_pointer.take() {
             lock.destroy();
         }
@@ -899,7 +900,6 @@ impl RelativePointerHandler for CaptureState {
                     Edge::Bottom => dy > 0.0,
                 };
                 if outward {
-                    self.capture_requested = true;
                     if self.locked_edge == Some(edge) {
                         self.begin_capture(edge);
                     } else {
@@ -950,9 +950,6 @@ impl PointerConstraintsHandler for CaptureState {
         };
         self.locked_edge = Some(edge);
         tracing::debug!(%edge, "Wayland pointer lock activated");
-        if self.capture_requested {
-            self.begin_capture(edge);
-        }
     }
     fn unlocked(
         &mut self,
@@ -964,7 +961,6 @@ impl PointerConstraintsHandler for CaptureState {
     ) {
         self.pending_edge = None;
         self.locked_edge = None;
-        self.capture_requested = false;
         if let Some(edge) = self.current_edge.take() {
             tracing::debug!(%edge, "Wayland pointer lock lost");
             self.active.store(false, Ordering::Release);

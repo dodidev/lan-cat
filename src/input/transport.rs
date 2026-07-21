@@ -153,6 +153,9 @@ async fn run(
                     &inbound,
                 ).await {
                     Ok(Some(peer)) => {
+                        if let Some(session) = sessions.get(&peer) {
+                            addresses.insert(peer.clone(), session.addr);
+                        }
                         if let Err(error) = flush_pending(&socket, &local_id, &mut sessions, &mut pending, &peer).await {
                             tracing::debug!(%peer, %error, "cursor pending send failed");
                             sessions.remove(&peer);
@@ -316,13 +319,57 @@ async fn receive_datagram(
             if version != WIRE_VERSION || !is_cursor_peer(cfg, &sender) {
                 bail!("unknown cursor peer or protocol version");
             }
+            let Some(session) = sessions.get(&sender) else {
+                send_hello(
+                    socket,
+                    cfg,
+                    local_id,
+                    &sender,
+                    addr,
+                    ephemeral_public,
+                    local_nonce,
+                    false,
+                )
+                .await?;
+                bail!("cursor session is not authenticated; handshake restarted");
+            };
+            let receive_key = session.receive_key;
+            if addr != session.addr {
+                sessions.remove(&sender);
+                send_hello(
+                    socket,
+                    cfg,
+                    local_id,
+                    &sender,
+                    addr,
+                    ephemeral_public,
+                    local_nonce,
+                    false,
+                )
+                .await?;
+                bail!("stale cursor address; handshake restarted");
+            }
+            let plain = match decrypt(&receive_key, &sender, sequence, &ciphertext) {
+                Ok(plain) => plain,
+                Err(error) => {
+                    sessions.remove(&sender);
+                    send_hello(
+                        socket,
+                        cfg,
+                        local_id,
+                        &sender,
+                        addr,
+                        ephemeral_public,
+                        local_nonce,
+                        false,
+                    )
+                    .await?;
+                    return Err(error.context("stale cursor session; handshake restarted"));
+                }
+            };
             let session = sessions
                 .get_mut(&sender)
-                .context("cursor session is not authenticated")?;
-            if addr != session.addr {
-                bail!("stale or misrouted cursor datagram");
-            }
-            let plain = decrypt(&session.receive_key, &sender, sequence, &ciphertext)?;
+                .context("cursor session disappeared during authentication")?;
             if !accept_sequence(
                 &mut session.receive_highest,
                 &mut session.receive_window,
