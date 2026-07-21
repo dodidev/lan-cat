@@ -208,9 +208,9 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             send_force_leave(&outbound, active.peer)?;
                         }
                     }
-                    CaptureEvent::LocalKeyboard(keyboard) => {
+                    CaptureEvent::LocalKeyboard(_keyboard) => {
                         #[cfg(debug_assertions)]
-                        update_debug_escape_kill(keyboard, &mut escape_started);
+                        update_debug_escape_kill(_keyboard, &mut escape_started);
                     }
                     CaptureEvent::CaptureLost => {
                         if let Some(active) = outgoing.take() {

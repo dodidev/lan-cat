@@ -19,6 +19,7 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer,
     delegate_pointer_constraints, delegate_registry, delegate_relative_pointer, delegate_seat,
     delegate_shm,
+    globals::ProvidesBoundGlobal,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -308,6 +309,9 @@ struct CaptureState {
     hovered: Option<Edge>,
     pointer_enter_serial: Option<u32>,
     position: f64,
+    pending_edge: Option<Edge>,
+    locked_edge: Option<Edge>,
+    capture_requested: bool,
     current_edge: Option<Edge>,
     active: Arc<AtomicBool>,
     allowed_edges: Arc<AtomicU8>,
@@ -395,6 +399,9 @@ fn run_capture(
         hovered: None,
         pointer_enter_serial: None,
         position: 0.5,
+        pending_edge: None,
+        locked_edge: None,
+        capture_requested: false,
         current_edge: None,
         active,
         allowed_edges,
@@ -409,6 +416,13 @@ fn run_capture(
     if state.pointer.is_none() {
         bail!("Wayland seat has no pointer capability");
     }
+    if state.relative_pointer.is_none() {
+        bail!("Wayland compositor does not support relative-pointer-v1");
+    }
+    state
+        .constraints
+        .bound_global()
+        .context("Wayland compositor does not support pointer-constraints-v1")?;
     ready.send(Ok(())).ok();
 
     loop {
@@ -469,9 +483,6 @@ impl CaptureState {
 
     fn sync_release(&mut self) {
         if self.current_edge.is_some() && !self.active.load(Ordering::Acquire) {
-            if let Some(lock) = self.locked_pointer.take() {
-                lock.destroy();
-            }
             if let Some(edge) = self.current_edge.take()
                 && let Some(layer) = self.layers.iter().find(|layer| layer.edge == edge)
             {
@@ -480,11 +491,20 @@ impl CaptureState {
                     .set_keyboard_interactivity(KeyboardInteractivity::None);
                 layer.layer.commit();
             }
+            self.reset_lock();
+        } else if self.current_edge.is_none()
+            && self.constraint_edge().is_some_and(|edge| {
+                self.allowed_edges.load(Ordering::Acquire) & edge_mask(edge) == 0
+            })
+        {
+            self.reset_lock();
         }
     }
 
-    fn start_capture(&mut self, qh: &QueueHandle<Self>, edge: Edge) {
+    fn request_lock(&mut self, qh: &QueueHandle<Self>, edge: Edge) {
         if self.current_edge.is_some()
+            || self.pending_edge.is_some()
+            || self.locked_edge.is_some()
             || self.allowed_edges.load(Ordering::Acquire) & edge_mask(edge) == 0
         {
             return;
@@ -502,22 +522,41 @@ impl CaptureState {
             layer.wl_surface(),
             pointer,
             None,
-            wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime::Persistent,
+            wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime::Oneshot,
             qh,
         ) else {
             return;
         };
         self.locked_pointer = Some(lock);
+        self.pending_edge = Some(edge);
+        // Pointer-constraint activation depends on committed surface state.
+        // Commit after creating the constraint so the compositor can activate
+        // it while this edge surface still owns pointer focus.
+        layer.commit();
+        tracing::debug!(%edge, "Wayland pointer lock requested");
+    }
+
+    fn begin_capture(&mut self, edge: Edge) {
+        if self.current_edge.is_some() || self.locked_edge != Some(edge) {
+            return;
+        }
+        let Some(layer) = self
+            .layers
+            .iter()
+            .find(|layer| layer.edge == edge)
+            .map(|layer| layer.layer.clone())
+        else {
+            self.reset_lock();
+            return;
+        };
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.commit();
-        if let Some(serial) = self.pointer_enter_serial {
+        if let (Some(pointer), Some(serial)) = (self.pointer.as_ref(), self.pointer_enter_serial) {
             pointer.set_cursor(serial, None, 0, 0);
         }
-        // Begin capture when the constraint request is issued. Lock activation
-        // is asynchronous; waiting for its event drops the relative motion that
-        // drives the edge gesture. `unlocked` still tears down a rejected lock.
         self.current_edge = Some(edge);
         self.active.store(true, Ordering::Release);
+        tracing::debug!(%edge, "Wayland pointer capture started");
         let (screen_width, screen_height) = self.estimate_screen_dimensions();
         let _ = self.events.send(CaptureEvent::Begin {
             edge,
@@ -525,6 +564,19 @@ impl CaptureState {
             screen_width,
             screen_height,
         });
+    }
+
+    fn constraint_edge(&self) -> Option<Edge> {
+        self.current_edge.or(self.locked_edge).or(self.pending_edge)
+    }
+
+    fn reset_lock(&mut self) {
+        self.pending_edge = None;
+        self.locked_edge = None;
+        self.capture_requested = false;
+        if let Some(lock) = self.locked_pointer.take() {
+            lock.destroy();
+        }
     }
 
     fn estimate_screen_dimensions(&self) -> (f64, f64) {
@@ -685,7 +737,7 @@ impl PointerHandler for CaptureState {
     fn pointer_frame(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
@@ -710,6 +762,7 @@ impl PointerHandler for CaptureState {
                             };
                             self.position = (coordinate / f64::from(span)).clamp(0.0, 1.0);
                         }
+                        self.request_lock(qh, edge);
                     }
                 }
                 PointerEventKind::Motion { .. } => {
@@ -733,6 +786,9 @@ impl PointerHandler for CaptureState {
                     self.pointer_enter_serial = None;
                     if self.current_edge.is_none() {
                         self.hovered = None;
+                        if self.locked_edge.is_none() {
+                            self.reset_lock();
+                        }
                     }
                 }
                 PointerEventKind::Press { button, .. } if self.current_edge.is_some() => {
@@ -835,7 +891,7 @@ impl RelativePointerHandler for CaptureState {
     ) {
         let (dx, dy) = event.delta;
         if self.current_edge.is_none() {
-            if let Some(edge) = self.hovered {
+            if let Some(edge) = self.constraint_edge().or(self.hovered) {
                 let outward = match edge {
                     Edge::Left => dx < 0.0,
                     Edge::Right => dx > 0.0,
@@ -843,7 +899,14 @@ impl RelativePointerHandler for CaptureState {
                     Edge::Bottom => dy > 0.0,
                 };
                 if outward {
-                    self.start_capture(qh, edge);
+                    self.capture_requested = true;
+                    if self.locked_edge == Some(edge) {
+                        self.begin_capture(edge);
+                    } else {
+                        self.request_lock(qh, edge);
+                    }
+                } else if self.locked_edge == Some(edge) {
+                    self.reset_lock();
                 }
             }
         }
@@ -882,6 +945,14 @@ impl PointerConstraintsHandler for CaptureState {
         _: &wl_surface::WlSurface,
         _: &wl_pointer::WlPointer,
     ) {
+        let Some(edge) = self.pending_edge.take() else {
+            return;
+        };
+        self.locked_edge = Some(edge);
+        tracing::debug!(%edge, "Wayland pointer lock activated");
+        if self.capture_requested {
+            self.begin_capture(edge);
+        }
     }
     fn unlocked(
         &mut self,
@@ -891,7 +962,11 @@ impl PointerConstraintsHandler for CaptureState {
         _: &wl_surface::WlSurface,
         _: &wl_pointer::WlPointer,
     ) {
+        self.pending_edge = None;
+        self.locked_edge = None;
+        self.capture_requested = false;
         if let Some(edge) = self.current_edge.take() {
+            tracing::debug!(%edge, "Wayland pointer lock lost");
             self.active.store(false, Ordering::Release);
             if let Some(layer) = self.layers.iter().find(|layer| layer.edge == edge) {
                 layer
