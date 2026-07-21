@@ -91,7 +91,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
     let mut preview: Option<Preview> = None;
     let mut takeover: Option<(String, Instant, Instant)> = None;
     let mut confirmed_peers = HashSet::new();
-    let mut portal_edges: HashMap<String, Edge> = HashMap::new();
+    let mut portal_edges: HashMap<String, HashSet<Edge>> = HashMap::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut last_ping = Instant::now() - Duration::from_secs(1);
@@ -133,7 +133,9 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             capture.release();
                             continue;
                         };
-                        if confirmed_peers.contains(&peer) {
+                        if confirmed_peers.contains(&peer)
+                            && portal_edge_confirmed(&portal_edges, &peer, edge)
+                        {
                             send(
                                 &outbound,
                                 peer.clone(),
@@ -243,7 +245,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             }
                             // Confirmed peers may enter directly; do not replay the portal UI.
                             if confirmed_peers.contains(&peer)
-                                && portal_edges.get(&peer) == Some(&edge)
+                                && portal_edge_confirmed(&portal_edges, &peer, edge)
                             {
                                 send(&outbound, peer, InputMessage::ProbeAck)?;
                                 continue;
@@ -292,7 +294,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         });
                         let outgoing_wins = outgoing.is_some() && local_id > peer;
                         let confirmed_portal = confirmed_peers.contains(&peer)
-                            && portal_edges.get(&peer) == Some(&edge);
+                            && portal_edge_confirmed(&portal_edges, &peer, edge);
                         let edge_available = portal_edge_available(&portal_edges, &peer, edge);
                         if !edge_available
                             || (!preview_matches && !confirmed_portal)
@@ -319,7 +321,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         }
                         capture.set_allowed_edge(Some(edge));
                         injector.begin(edge, position)?;
-                        portal_edges.entry(peer.clone()).or_insert(edge);
+                        portal_edges.entry(peer.clone()).or_default().insert(edge);
                         confirmed_peers.insert(peer.clone());
                         incoming = Some(Incoming {
                             peer: peer.clone(),
@@ -342,7 +344,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             if *active == peer {
                                 *ready = true;
                                 tracing::debug!(%peer, source_edge = %edge, "cursor entry acknowledged");
-                                portal_edges.entry(peer.clone()).or_insert(*edge);
+                                portal_edges.entry(peer.clone()).or_default().insert(*edge);
                                 confirmed_peers.insert(peer);
                             }
                         }
@@ -544,7 +546,7 @@ fn peer_timed_out(last_seen: &HashMap<String, Instant>, peer: &str) -> bool {
 fn select_peer(
     cfg: &Config,
     online: &HashMap<String, Instant>,
-    portal_edges: &HashMap<String, Edge>,
+    portal_edges: &HashMap<String, HashSet<Edge>>,
     edge: Edge,
     position: f64,
 ) -> Option<String> {
@@ -568,11 +570,25 @@ fn select_peer(
     peers.get(index).cloned()
 }
 
-fn portal_edge_available(portal_edges: &HashMap<String, Edge>, peer: &str, edge: Edge) -> bool {
-    match portal_edges.get(peer) {
-        Some(remembered) => *remembered == edge,
-        None => !portal_edges.values().any(|remembered| *remembered == edge),
-    }
+fn portal_edge_available(
+    portal_edges: &HashMap<String, HashSet<Edge>>,
+    peer: &str,
+    edge: Edge,
+) -> bool {
+    portal_edge_confirmed(portal_edges, peer, edge)
+        || !portal_edges
+            .iter()
+            .any(|(bound_peer, edges)| bound_peer != peer && edges.contains(&edge))
+}
+
+fn portal_edge_confirmed(
+    portal_edges: &HashMap<String, HashSet<Edge>>,
+    peer: &str,
+    edge: Edge,
+) -> bool {
+    portal_edges
+        .get(peer)
+        .is_some_and(|edges| edges.contains(&edge))
 }
 
 fn pressure(edge: Edge, pointer: protocol::PointerInput) -> Option<(f64, f64)> {
@@ -769,16 +785,28 @@ mod tests {
     }
 
     #[test]
-    fn portal_binding_accepts_only_remembered_edge() {
-        let portal_edges = HashMap::from([("peer".to_owned(), Edge::Right)]);
+    fn portal_binding_allows_same_peer_on_every_unclaimed_edge() {
+        let mut portal_edges = HashMap::from([(
+            "peer".to_owned(),
+            HashSet::from([Edge::Right]),
+        )]);
+        assert!(portal_edge_confirmed(&portal_edges, "peer", Edge::Right));
+        assert!(!portal_edge_confirmed(&portal_edges, "peer", Edge::Left));
         assert!(portal_edge_available(&portal_edges, "peer", Edge::Right));
-        assert!(!portal_edge_available(&portal_edges, "peer", Edge::Left));
+        assert!(portal_edge_available(&portal_edges, "peer", Edge::Left));
         assert!(!portal_edge_available(
             &portal_edges,
             "new-peer",
             Edge::Right
         ));
         assert!(portal_edge_available(&portal_edges, "new-peer", Edge::Left));
+
+        portal_edges
+            .entry("peer".to_owned())
+            .or_default()
+            .insert(Edge::Top);
+        assert!(portal_edge_confirmed(&portal_edges, "peer", Edge::Right));
+        assert!(portal_edge_confirmed(&portal_edges, "peer", Edge::Top));
     }
 
     #[test]

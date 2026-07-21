@@ -10,7 +10,7 @@ use std::{
         mpsc as std_mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -62,7 +62,8 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 use super::{ALL_EDGE_MASK, CaptureEvent, edge_mask};
 use crate::input::protocol::{Edge, KeyboardInput, PointerInput};
 
-const EDGE_THICKNESS: u32 = 2;
+const EDGE_THICKNESS: u32 = 8;
+const IDLE_LOCK_TIMEOUT: Duration = Duration::from_millis(750);
 const POOL_BYTES: usize = 512 * 1024;
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
@@ -311,6 +312,8 @@ struct CaptureState {
     position: f64,
     pending_edge: Option<Edge>,
     locked_edge: Option<Edge>,
+    lock_activated: bool,
+    lock_requested_at: Option<Instant>,
     current_edge: Option<Edge>,
     active: Arc<AtomicBool>,
     allowed_edges: Arc<AtomicU8>,
@@ -400,6 +403,8 @@ fn run_capture(
         position: 0.5,
         pending_edge: None,
         locked_edge: None,
+        lock_activated: false,
+        lock_requested_at: None,
         current_edge: None,
         active,
         allowed_edges,
@@ -496,6 +501,12 @@ impl CaptureState {
             })
         {
             self.reset_lock();
+        } else if self.current_edge.is_none()
+            && self
+                .lock_requested_at
+                .is_some_and(|requested| requested.elapsed() >= IDLE_LOCK_TIMEOUT)
+        {
+            self.reset_lock();
         }
     }
 
@@ -516,6 +527,11 @@ impl CaptureState {
         ) else {
             return;
         };
+        // Give the edge surface keyboard focus before asking for the pointer
+        // constraint. Compositors may refuse to activate a lock for an
+        // unfocused layer-shell surface.
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.commit();
         let Ok(lock) = self.constraints.lock_pointer(
             layer.wl_surface(),
             pointer,
@@ -523,14 +539,21 @@ impl CaptureState {
             wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime::Persistent,
             qh,
         ) else {
+            layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            layer.commit();
             return;
         };
         self.locked_pointer = Some(lock);
         self.pending_edge = Some(edge);
+        self.lock_activated = false;
+        self.lock_requested_at = Some(Instant::now());
         // Pointer-constraint activation events are not delivered consistently
         // by every compositor. A successful request while the edge owns focus
         // is enough to start capture; a later `unlocked` event still cancels it.
         self.locked_edge = Some(edge);
+        if let Some(serial) = self.pointer_enter_serial {
+            pointer.set_cursor(serial, None, 0, 0);
+        }
         // Pointer-constraint activation depends on committed surface state.
         // Commit after creating the constraint so the compositor can activate
         // it while this edge surface still owns pointer focus.
@@ -557,6 +580,7 @@ impl CaptureState {
             pointer.set_cursor(serial, None, 0, 0);
         }
         self.current_edge = Some(edge);
+        self.lock_requested_at = None;
         self.active.store(true, Ordering::Release);
         tracing::debug!(%edge, "Wayland pointer capture started");
         let (screen_width, screen_height) = self.estimate_screen_dimensions();
@@ -573,10 +597,24 @@ impl CaptureState {
     }
 
     fn reset_lock(&mut self) {
+        let edge = self.constraint_edge();
         self.pending_edge = None;
         self.locked_edge = None;
+        self.lock_activated = false;
+        self.lock_requested_at = None;
         if let Some(lock) = self.locked_pointer.take() {
             lock.destroy();
+        }
+        if let Some(layer) =
+            edge.and_then(|edge| self.layers.iter().find(|layer| layer.edge == edge))
+        {
+            layer
+                .layer
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            layer.layer.commit();
+        }
+        if let Some(edge) = edge {
+            tracing::debug!(%edge, "Wayland pointer lock cancelled");
         }
     }
 
@@ -787,7 +825,7 @@ impl PointerHandler for CaptureState {
                     self.pointer_enter_serial = None;
                     if self.current_edge.is_none() {
                         self.hovered = None;
-                        if self.locked_edge.is_none() {
+                        if !self.lock_activated {
                             self.reset_lock();
                         }
                     }
@@ -949,6 +987,7 @@ impl PointerConstraintsHandler for CaptureState {
             return;
         };
         self.locked_edge = Some(edge);
+        self.lock_activated = true;
         tracing::debug!(%edge, "Wayland pointer lock activated");
     }
     fn unlocked(
@@ -959,18 +998,25 @@ impl PointerConstraintsHandler for CaptureState {
         _: &wl_surface::WlSurface,
         _: &wl_pointer::WlPointer,
     ) {
+        let constraint_edge = self.constraint_edge();
         self.pending_edge = None;
         self.locked_edge = None;
-        if let Some(edge) = self.current_edge.take() {
+        self.lock_activated = false;
+        self.lock_requested_at = None;
+        let active_edge = self.current_edge.take();
+        if let Some(edge) = active_edge {
             tracing::debug!(%edge, "Wayland pointer lock lost");
             self.active.store(false, Ordering::Release);
-            if let Some(layer) = self.layers.iter().find(|layer| layer.edge == edge) {
-                layer
-                    .layer
-                    .set_keyboard_interactivity(KeyboardInteractivity::None);
-                layer.layer.commit();
-            }
             let _ = self.events.send(CaptureEvent::CaptureLost);
+        }
+        if let Some(layer) = active_edge
+            .or(constraint_edge)
+            .and_then(|edge| self.layers.iter().find(|layer| layer.edge == edge))
+        {
+            layer
+                .layer
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            layer.layer.commit();
         }
         if let Some(lock) = self.locked_pointer.take() {
             lock.destroy();
