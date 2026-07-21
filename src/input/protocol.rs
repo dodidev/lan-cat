@@ -92,7 +92,9 @@ pub enum InputMessage {
     Enter {
         edge: Edge,
         position: f64,
+        #[serde(default = "default_screen_width")]
         screen_width: f64,
+        #[serde(default = "default_screen_height")]
         screen_height: f64,
     },
     Ack,
@@ -101,6 +103,14 @@ pub enum InputMessage {
     Keyboard(KeyboardInput),
     Ping,
     Pong,
+}
+
+fn default_screen_width() -> f64 {
+    1920.0
+}
+
+fn default_screen_height() -> f64 {
+    1080.0
 }
 
 impl InputMessage {
@@ -117,10 +127,17 @@ impl InputMessage {
             {
                 bail!("invalid cursor probe")
             }
-            Self::Enter { position, screen_width, screen_height, .. }
-                if !position.is_finite() || !(0.0..=1.0).contains(&position)
-                    || !screen_width.is_finite() || screen_width <= 0.0
-                    || !screen_height.is_finite() || screen_height <= 0.0 =>
+            Self::Enter {
+                position,
+                screen_width,
+                screen_height,
+                ..
+            } if !position.is_finite()
+                || !(0.0..=1.0).contains(&position)
+                || !screen_width.is_finite()
+                || screen_width <= 0.0
+                || !screen_height.is_finite()
+                || screen_height <= 0.0 =>
             {
                 bail!("invalid cursor entry")
             }
@@ -133,6 +150,21 @@ impl InputMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    enum LegacyInputMessage {
+        Probe {
+            edge: Edge,
+            position: f64,
+            progress: f32,
+        },
+        ProbeAck,
+        Cancel,
+        Enter {
+            edge: Edge,
+            position: f64,
+        },
+    }
 
     #[test]
     fn edges_are_opposites() {
@@ -168,6 +200,36 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_cursor_entry_uses_safe_screen_defaults() {
+        let bytes = serde_cbor::to_vec(&LegacyInputMessage::Enter {
+            edge: Edge::Left,
+            position: 0.25,
+        })
+        .unwrap();
+        let message: InputMessage = serde_cbor::from_slice(&bytes).unwrap();
+        assert_eq!(
+            message,
+            InputMessage::Enter {
+                edge: Edge::Left,
+                position: 0.25,
+                screen_width: 1920.0,
+                screen_height: 1080.0,
+            }
+        );
+        message.validate().unwrap();
+
+        let bytes = serde_cbor::to_vec(&message).unwrap();
+        let legacy: LegacyInputMessage = serde_cbor::from_slice(&bytes).unwrap();
+        assert_eq!(
+            legacy,
+            LegacyInputMessage::Enter {
+                edge: Edge::Left,
+                position: 0.25,
+            }
         );
     }
 }
