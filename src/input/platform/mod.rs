@@ -28,4 +28,5 @@ pub enum CaptureEvent {
     Keyboard(KeyboardInput),
     LocalInput,
     LocalKeyboard(KeyboardInput),
+    CaptureLost,
 }

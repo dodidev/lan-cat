@@ -212,6 +212,17 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         #[cfg(debug_assertions)]
                         update_debug_escape_kill(keyboard, &mut escape_started);
                     }
+                    CaptureEvent::CaptureLost => {
+                        if let Some(active) = outgoing.take() {
+                            send_force_leave(&outbound, outgoing_peer(&active).to_owned())?;
+                        }
+                        if let Some(active) = incoming.take() {
+                            injector.end()?;
+                            send_force_leave(&outbound, active.peer)?;
+                        }
+                        capture.allow_all_edges();
+                        capture.release();
+                    }
                 }
             }
             event = inbound.recv() => {

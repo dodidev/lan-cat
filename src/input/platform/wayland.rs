@@ -308,6 +308,7 @@ struct CaptureState {
     hovered: Option<Edge>,
     pointer_enter_serial: Option<u32>,
     position: f64,
+    pending_edge: Option<Edge>,
     current_edge: Option<Edge>,
     active: Arc<AtomicBool>,
     allowed_edges: Arc<AtomicU8>,
@@ -395,6 +396,7 @@ fn run_capture(
         hovered: None,
         pointer_enter_serial: None,
         position: 0.5,
+        pending_edge: None,
         current_edge: None,
         active,
         allowed_edges,
@@ -485,6 +487,7 @@ impl CaptureState {
 
     fn start_capture(&mut self, qh: &QueueHandle<Self>, edge: Edge) {
         if self.current_edge.is_some()
+            || self.pending_edge.is_some()
             || self.allowed_edges.load(Ordering::Acquire) & edge_mask(edge) == 0
         {
             return;
@@ -513,18 +516,7 @@ impl CaptureState {
         if let Some(serial) = self.pointer_enter_serial {
             pointer.set_cursor(serial, None, 0, 0);
         }
-        self.current_edge = Some(edge);
-        self.active.store(true, Ordering::Release);
-        
-        // Estimate screen dimensions from configured layers
-        let (screen_width, screen_height) = self.estimate_screen_dimensions();
-        
-        let _ = self.events.send(CaptureEvent::Begin {
-            edge,
-            position: self.position,
-            screen_width,
-            screen_height,
-        });
+        self.pending_edge = Some(edge);
     }
     
     fn estimate_screen_dimensions(&self) -> (f64, f64) {
@@ -882,6 +874,18 @@ impl PointerConstraintsHandler for CaptureState {
         _: &wl_surface::WlSurface,
         _: &wl_pointer::WlPointer,
     ) {
+        let Some(edge) = self.pending_edge.take() else {
+            return;
+        };
+        self.current_edge = Some(edge);
+        self.active.store(true, Ordering::Release);
+        let (screen_width, screen_height) = self.estimate_screen_dimensions();
+        let _ = self.events.send(CaptureEvent::Begin {
+            edge,
+            position: self.position,
+            screen_width,
+            screen_height,
+        });
     }
     fn unlocked(
         &mut self,
@@ -891,6 +895,20 @@ impl PointerConstraintsHandler for CaptureState {
         _: &wl_surface::WlSurface,
         _: &wl_pointer::WlPointer,
     ) {
+        self.pending_edge = None;
+        if let Some(edge) = self.current_edge.take() {
+            self.active.store(false, Ordering::Release);
+            if let Some(layer) = self.layers.iter().find(|layer| layer.edge == edge) {
+                layer
+                    .layer
+                    .set_keyboard_interactivity(KeyboardInteractivity::None);
+                layer.layer.commit();
+            }
+            let _ = self.events.send(CaptureEvent::CaptureLost);
+        }
+        if let Some(lock) = self.locked_pointer.take() {
+            lock.destroy();
+        }
     }
 }
 
