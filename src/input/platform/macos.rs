@@ -184,6 +184,12 @@ impl Capture {
         }
     }
 
+    pub fn set_allowed_edges(&self, edges: u8) {
+        if let Ok(mut state) = self.state.lock() {
+            state.allowed_edges = edges & ALL_EDGE_MASK;
+        }
+    }
+
     pub fn allow_all_edges(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.allowed_edges = ALL_EDGE_MASK;

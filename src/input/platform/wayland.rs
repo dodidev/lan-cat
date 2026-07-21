@@ -147,6 +147,11 @@ impl Capture {
             .store(edge.map_or(0, edge_mask), Ordering::Release);
     }
 
+    pub fn set_allowed_edges(&self, edges: u8) {
+        self.allowed_edges
+            .store(edges & ALL_EDGE_MASK, Ordering::Release);
+    }
+
     pub fn allow_all_edges(&self) {
         self.allowed_edges.store(ALL_EDGE_MASK, Ordering::Release);
     }
@@ -343,10 +348,16 @@ fn run_capture(
     let mut layers = Vec::new();
     for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
         let surface = compositor.create_surface(&qh);
+        // Side portals need overlay priority over normal windows. Horizontal
+        // portals stay on the top layer so overlay panels can still own input.
+        let shell_layer = match edge {
+            Edge::Left | Edge::Right => Layer::Overlay,
+            Edge::Top | Edge::Bottom => Layer::Top,
+        };
         let layer = layer_shell.create_layer_surface(
             &qh,
             surface,
-            Layer::Overlay,
+            shell_layer,
             Some("lan-cat-cursor-edge"),
             None,
         );
@@ -554,9 +565,9 @@ impl CaptureState {
         // by every compositor. A successful request while the edge owns focus
         // is enough to start capture; a later `unlocked` event still cancels it.
         self.locked_edge = Some(edge);
-        if let Some(serial) = self.pointer_enter_serial {
-            pointer.set_cursor(serial, None, 0, 0);
-        }
+        // Do not hide cursor while merely requesting a constraint. Pointer may
+        // be entering a panel at this edge. begin_capture hides it only after
+        // actual outward motion confirms portal intent.
         // Pointer-constraint activation depends on committed surface state.
         // Commit after creating the constraint so the compositor can activate
         // it while this edge surface still owns pointer focus.
