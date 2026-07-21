@@ -1,4 +1,10 @@
-use std::{collections::VecDeque, ffi::OsStr, fs, io::Read, path::PathBuf};
+use std::{
+    collections::{HashSet, VecDeque},
+    ffi::OsStr,
+    fs,
+    io::Read,
+    path::PathBuf,
+};
 
 #[cfg(any(target_os = "linux", test))]
 use std::{
@@ -29,16 +35,18 @@ pub(super) fn paths_from_file_uris<'a>(
 
 pub(super) fn read_file_paths(paths: Vec<PathBuf>) -> Result<Vec<ClipboardFile>> {
     let mut files = Vec::new();
+    let mut names = HashSet::new();
     let mut remaining = MAX_PAYLOAD_BYTES;
     for path in paths {
         if files.len() == MAX_FILES {
             anyhow::bail!("clipboard contains more than {MAX_FILES} files");
         }
-        let name = path
+        let original_name = path
             .file_name()
             .and_then(OsStr::to_str)
             .context("clipboard filename is not valid UTF-8")?
             .to_owned();
+        let name = unique_file_name(&original_name, &mut names);
         remaining = remaining
             .checked_sub(name.len())
             .context("clipboard files exceed size limit")?;
@@ -60,6 +68,33 @@ pub(super) fn read_file_paths(paths: Vec<PathBuf>) -> Result<Vec<ClipboardFile>>
         files.push(ClipboardFile { name, data });
     }
     Ok(files)
+}
+
+fn unique_file_name(name: &str, used: &mut HashSet<String>) -> String {
+    if used.insert(name.to_owned()) {
+        return name.to_owned();
+    }
+
+    let (stem, extension) = name
+        .rsplit_once('.')
+        .map_or((name, ""), |(stem, extension)| {
+            if stem.is_empty() {
+                (name, "")
+            } else {
+                (stem, extension)
+            }
+        });
+    for index in 2.. {
+        let candidate = if extension.is_empty() {
+            format!("{stem} ({index})")
+        } else {
+            format!("{stem} ({index}).{extension}")
+        };
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded numeric suffix must eventually produce a unique filename")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -158,5 +193,22 @@ mod tests {
     fn file_uri_rejects_remote_hosts_and_bad_escapes() {
         assert!(path_from_file_uri("file://server/share/file.txt").is_err());
         assert!(path_from_file_uri("file:///tmp/bad%XXname").is_err());
+    }
+
+    #[test]
+    fn duplicate_clipboard_filenames_are_renamed() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = first_dir.path().join("report.txt");
+        let second = second_dir.path().join("report.txt");
+        fs::write(&first, b"one").unwrap();
+        fs::write(&second, b"two").unwrap();
+
+        let files = read_file_paths(vec![first, second]).unwrap();
+
+        assert_eq!(files[0].name, "report.txt");
+        assert_eq!(files[0].data, b"one");
+        assert_eq!(files[1].name, "report (2).txt");
+        assert_eq!(files[1].data, b"two");
     }
 }

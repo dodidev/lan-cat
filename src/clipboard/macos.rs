@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Context, Result};
 use objc2::{rc::autoreleasepool, runtime::ProtocolObject};
 use objc2_app_kit::{
-    NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeHTML, NSPasteboardTypePNG,
-    NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardWriting,
+    NSPasteboard, NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypeHTML,
+    NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardWriting,
 };
 use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 use tokio::sync::mpsc as async_mpsc;
@@ -109,12 +109,8 @@ fn read_payload_from(pasteboard: &NSPasteboard) -> Option<ClipboardPayload> {
     // SAFETY: These AppKit pasteboard type constants exist on every supported macOS version.
     let payload = unsafe {
         ClipboardPayload {
-            text: pasteboard
-                .stringForType(NSPasteboardTypeString)
-                .map(|value| value.to_string()),
-            html: pasteboard
-                .stringForType(NSPasteboardTypeHTML)
-                .map(|value| value.to_string()),
+            text: string_for_type(pasteboard, NSPasteboardTypeString),
+            html: string_for_type(pasteboard, NSPasteboardTypeHTML),
             rtf: data_for_type(pasteboard, NSPasteboardTypeRTF)
                 .and_then(|bytes| String::from_utf8(bytes).ok()),
             png: data_for_type(pasteboard, NSPasteboardTypePNG),
@@ -125,11 +121,37 @@ fn read_payload_from(pasteboard: &NSPasteboard) -> Option<ClipboardPayload> {
     Some(payload)
 }
 
+fn string_for_type(
+    pasteboard: &NSPasteboard,
+    ty: &'static objc2_app_kit::NSPasteboardType,
+) -> Option<String> {
+    item_for_type(pasteboard, |item| {
+        item.stringForType(ty).map(|value| value.to_string())
+    })
+    .or_else(|| pasteboard.stringForType(ty).map(|value| value.to_string()))
+}
+
 fn data_for_type(
     pasteboard: &NSPasteboard,
     ty: &'static objc2_app_kit::NSPasteboardType,
 ) -> Option<Vec<u8>> {
-    pasteboard.dataForType(ty).map(|data| data.to_vec())
+    item_for_type(pasteboard, |item| {
+        item.dataForType(ty).map(|data| data.to_vec())
+    })
+    .or_else(|| pasteboard.dataForType(ty).map(|data| data.to_vec()))
+}
+
+fn item_for_type<T>(
+    pasteboard: &NSPasteboard,
+    mut read: impl FnMut(&NSPasteboardItem) -> Option<T>,
+) -> Option<T> {
+    let items = pasteboard.pasteboardItems()?;
+    for item in items.to_vec() {
+        if let Some(value) = read(&item) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn read_files(pasteboard: &NSPasteboard) -> Result<Option<Vec<ClipboardFile>>> {
@@ -271,6 +293,25 @@ mod tests {
                     path.canonicalize().unwrap()
                 );
             }
+        });
+    }
+
+    #[test]
+    fn item_level_text_is_read_from_macos_pasteboard() {
+        autoreleasepool(|_| {
+            let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+            let item = NSPasteboardItem::new();
+            item.setString_forType(&NSString::from_str("from item"), unsafe {
+                NSPasteboardTypeString
+            });
+            let object = ProtocolObject::<dyn NSPasteboardWriting>::from_retained(item);
+            let objects = NSArray::from_retained_slice(&[object]);
+
+            pasteboard.clearContents();
+            assert!(pasteboard.writeObjects(&objects));
+
+            let payload = read_payload_from(&pasteboard).unwrap();
+            assert_eq!(payload.text.as_deref(), Some("from item"));
         });
     }
 }
