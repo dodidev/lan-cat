@@ -180,6 +180,16 @@ impl Capture {
             state.allowed_edges = edge.map_or(0, edge_mask);
         }
     }
+
+    pub fn allow_all_edges(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.allowed_edges = ALL_EDGE_MASK;
+        }
+    }
+
+    pub fn screen_dimensions(&self) -> (f64, f64) {
+        screen_dimensions()
+    }
 }
 
 impl Drop for Capture {

@@ -18,19 +18,6 @@ use platform::{Capture, CaptureEvent, Injector};
 use protocol::{Edge, InputMessage, PointerInput};
 use transport::{Inbound, Outbound};
 
-// Screen dimensions getter - different implementations per platform
-#[cfg(target_os = "macos")]
-fn get_local_screen_dimensions() -> (f64, f64) {
-    platform::screen_dimensions()
-}
-
-#[cfg(target_os = "linux")]
-fn get_local_screen_dimensions() -> (f64, f64) {
-    // For Wayland injector, screen size is not as critical since we use
-    // normalized coordinates, but we'll use a default for consistency
-    (1920.0, 1080.0)
-}
-
 const CONFIRM_TIME: Duration = Duration::from_secs(2);
 const PRESS_GAP: Duration = Duration::from_millis(280);
 const PEER_TIMEOUT: Duration = Duration::from_millis(1_200);
@@ -78,27 +65,6 @@ struct Preview {
     beacon: Beacon,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum PortalRole {
-    Undecided,
-    Controller,
-    Target { controller: String },
-}
-
-impl PortalRole {
-    fn allows_outgoing(&self) -> bool {
-        !matches!(self, Self::Target { .. })
-    }
-
-    fn allows_incoming(&self, peer: &str) -> bool {
-        match self {
-            Self::Undecided => true,
-            Self::Controller => false,
-            Self::Target { controller } => controller == peer,
-        }
-    }
-}
-
 pub fn spawn(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
     std::thread::Builder::new()
         .name("lan-cat-input".into())
@@ -127,7 +93,6 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
     let mut takeover: Option<(String, Instant, Instant)> = None;
     let mut confirmed_peers = HashSet::new();
     let mut portal_edges: HashMap<String, Edge> = HashMap::new();
-    let mut portal_role = PortalRole::Undecided;
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut last_ping = Instant::now() - Duration::from_secs(1);
@@ -147,16 +112,12 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         if incoming.as_ref().is_some_and(|active| active.edge == edge) {
                             let active = incoming.take().expect("incoming cursor");
                             injector.end()?;
-                            capture.set_allowed_edge(None);
+                            capture.allow_all_edges();
                             send(&outbound, active.peer, InputMessage::Leave)?;
                             capture.release();
                             continue;
                         }
                         if outgoing.is_some() || incoming.is_some() {
-                            continue;
-                        }
-                        if !portal_role.allows_outgoing() {
-                            capture.release();
                             continue;
                         }
                         let peer = {
@@ -241,7 +202,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                     CaptureEvent::LocalInput => {
                         if let Some(active) = incoming.take() {
                             injector.end()?;
-                            capture.set_allowed_edge(None);
+                            capture.allow_all_edges();
                             capture.release();
                             takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
                             send_force_leave(&outbound, active.peer)?;
@@ -264,7 +225,6 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                     match message {
                         InputMessage::Probe { edge, position, progress } => {
                             if incoming.is_some()
-                                || !portal_role.allows_incoming(&peer)
                                 || !portal_edge_available(&portal_edges, &peer, edge)
                             {
                                 send_force_leave(&outbound, peer)?;
@@ -325,8 +285,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         let outgoing_wins = outgoing.is_some() && local_id > peer;
                         let confirmed_portal = confirmed_peers.contains(&peer)
                             && portal_edges.get(&peer) == Some(&edge);
-                        if !portal_role.allows_incoming(&peer)
-                            || !portal_edge_available(&portal_edges, &peer, edge)
+                        if !portal_edge_available(&portal_edges, &peer, edge)
                             || (!preview_matches && !confirmed_portal)
                             || incoming.is_some()
                             || outgoing_wins
@@ -341,11 +300,6 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         }
                         capture.set_allowed_edge(Some(edge));
                         injector.begin(edge, position)?;
-                        if portal_role == PortalRole::Undecided {
-                            portal_role = PortalRole::Target {
-                                controller: peer.clone(),
-                            };
-                        }
                         portal_edges.entry(peer.clone()).or_insert(edge);
                         confirmed_peers.insert(peer.clone());
                         incoming = Some(Incoming {
@@ -367,9 +321,6 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         }) = &mut outgoing {
                             if *active == peer {
                                 *ready = true;
-                                if portal_role == PortalRole::Undecided {
-                                    portal_role = PortalRole::Controller;
-                                }
                                 portal_edges.entry(peer.clone()).or_insert(*edge);
                                 confirmed_peers.insert(peer);
                             }
@@ -391,7 +342,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         if incoming.as_ref().is_some_and(|value| value.peer == peer) {
                             injector.end()?;
                             incoming = None;
-                            capture.set_allowed_edge(None);
+                            capture.allow_all_edges();
                         }
                     }
                     InputMessage::Pointer(pointer) => {
@@ -403,18 +354,14 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         } else if let Some(incoming_state) = &mut incoming {
                             if incoming_state.peer == peer {
                                 // Scale pointer motion based on screen dimensions
-                                let scaled_pointer = match pointer {
-                                    PointerInput::Motion { dx, dy } => {
-                                        let (local_width, local_height) = get_local_screen_dimensions();
-                                        let scale_x = local_width / incoming_state.peer_screen_width;
-                                        let scale_y = local_height / incoming_state.peer_screen_height;
-                                        PointerInput::Motion {
-                                            dx: dx * scale_x,
-                                            dy: dy * scale_y,
-                                        }
-                                    }
-                                    other => other,
-                                };
+                                let scaled_pointer = scale_pointer_motion(
+                                    pointer,
+                                    capture.screen_dimensions(),
+                                    (
+                                        incoming_state.peer_screen_width,
+                                        incoming_state.peer_screen_height,
+                                    ),
+                                );
                                 injector.apply(scaled_pointer)?;
                                 #[cfg(target_os = "macos")]
                                 let left_remote = injector.left_entry_edge(
@@ -429,7 +376,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 );
                                 if left_remote {
                                     injector.end()?;
-                                    capture.set_allowed_edge(None);
+                                    capture.allow_all_edges();
                                     incoming = None;
                                     send(&outbound, peer, InputMessage::Leave)?;
                                 }
@@ -468,16 +415,10 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                 {
                     incoming = None;
                     injector.end()?;
-                    capture.set_allowed_edge(None);
+                    capture.allow_all_edges();
                 }
                 confirmed_peers.retain(|peer| trusted_peers.contains(peer));
                 portal_edges.retain(|peer, _| trusted_peers.contains(peer));
-                if matches!(
-                    &portal_role,
-                    PortalRole::Target { controller } if !trusted_peers.contains(controller)
-                ) {
-                    portal_role = PortalRole::Undecided;
-                }
                 if last_ping.elapsed() >= Duration::from_millis(500) {
                     for peer in &trusted_peers {
                         send(&outbound, peer.clone(), InputMessage::Ping)?;
@@ -550,7 +491,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         send_force_leave(&outbound, active.peer)?;
                     }
                     injector.end()?;
-                    capture.set_allowed_edge(None);
+                    capture.allow_all_edges();
                 }
             }
         }
@@ -638,6 +579,20 @@ fn crosses_remote_entry_edge(
     depth: &mut f64,
 ) -> bool {
     crosses_host_edge(entry_edge.opposite(), pointer, depth)
+}
+
+fn scale_pointer_motion(
+    pointer: PointerInput,
+    local_screen: (f64, f64),
+    peer_screen: (f64, f64),
+) -> PointerInput {
+    match pointer {
+        PointerInput::Motion { dx, dy } => PointerInput::Motion {
+            dx: dx * local_screen.0 / peer_screen.0,
+            dy: dy * local_screen.1 / peer_screen.1,
+        },
+        other => other,
+    }
 }
 
 fn send_probe(
@@ -777,17 +732,24 @@ mod tests {
     }
 
     #[test]
-    fn target_role_cannot_chain_to_another_machine() {
-        let role = PortalRole::Target {
-            controller: "main".to_owned(),
+    fn pointer_motion_scales_for_different_screen_sizes() {
+        let PointerInput::Motion { dx, dy } = scale_pointer_motion(
+            PointerInput::Motion { dx: 10.0, dy: 10.0 },
+            (2560.0, 1080.0),
+            (1920.0, 2160.0),
+        ) else {
+            panic!("motion must remain motion");
         };
-        assert!(!role.allows_outgoing());
-        assert!(role.allows_incoming("main"));
-        assert!(!role.allows_incoming("other"));
-
-        let role = PortalRole::Controller;
-        assert!(role.allows_outgoing());
-        assert!(!role.allows_incoming("other"));
+        assert!((dx - 13.333333333333334).abs() < f64::EPSILON);
+        assert_eq!(dy, 5.0);
+        assert_eq!(
+            scale_pointer_motion(
+                PointerInput::Button { button: 1, state: 1 },
+                (2560.0, 1080.0),
+                (1920.0, 2160.0),
+            ),
+            PointerInput::Button { button: 1, state: 1 }
+        );
     }
 
     #[test]

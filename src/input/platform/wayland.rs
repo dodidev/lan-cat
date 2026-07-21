@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
         mpsc as std_mpsc,
     },
     thread,
@@ -84,6 +84,8 @@ pub struct Capture {
     pub events: mpsc::UnboundedReceiver<CaptureEvent>,
     active: Arc<AtomicBool>,
     allowed_edges: Arc<AtomicU8>,
+    screen_width: Arc<AtomicU32>,
+    screen_height: Arc<AtomicU32>,
 }
 
 impl Capture {
@@ -92,8 +94,12 @@ impl Capture {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let active = Arc::new(AtomicBool::new(false));
         let allowed_edges = Arc::new(AtomicU8::new(ALL_EDGE_MASK));
+        let screen_width = Arc::new(AtomicU32::new(1920));
+        let screen_height = Arc::new(AtomicU32::new(1080));
         let thread_active = active.clone();
         let thread_allowed_edges = allowed_edges.clone();
+        let thread_screen_width = screen_width.clone();
+        let thread_screen_height = screen_height.clone();
         let capture_events_tx = events_tx.clone();
 
         thread::Builder::new()
@@ -103,6 +109,8 @@ impl Capture {
                     capture_events_tx,
                     thread_active,
                     thread_allowed_edges,
+                    thread_screen_width,
+                    thread_screen_height,
                     ready_tx.clone(),
                 );
                 if let Err(error) = result {
@@ -120,6 +128,8 @@ impl Capture {
             events,
             active,
             allowed_edges,
+            screen_width,
+            screen_height,
         })
     }
 
@@ -130,6 +140,17 @@ impl Capture {
     pub fn set_allowed_edge(&self, edge: Option<Edge>) {
         self.allowed_edges
             .store(edge.map_or(0, edge_mask), Ordering::Release);
+    }
+
+    pub fn allow_all_edges(&self) {
+        self.allowed_edges.store(ALL_EDGE_MASK, Ordering::Release);
+    }
+
+    pub fn screen_dimensions(&self) -> (f64, f64) {
+        (
+            f64::from(self.screen_width.load(Ordering::Acquire)),
+            f64::from(self.screen_height.load(Ordering::Acquire)),
+        )
     }
 }
 
@@ -290,6 +311,8 @@ struct CaptureState {
     current_edge: Option<Edge>,
     active: Arc<AtomicBool>,
     allowed_edges: Arc<AtomicU8>,
+    screen_width: Arc<AtomicU32>,
+    screen_height: Arc<AtomicU32>,
     events: mpsc::UnboundedSender<CaptureEvent>,
 }
 
@@ -297,6 +320,8 @@ fn run_capture(
     events: mpsc::UnboundedSender<CaptureEvent>,
     active: Arc<AtomicBool>,
     allowed_edges: Arc<AtomicU8>,
+    screen_width: Arc<AtomicU32>,
+    screen_height: Arc<AtomicU32>,
     ready: std_mpsc::SyncSender<Result<()>>,
 ) -> Result<()> {
     let connection = Connection::connect_to_env().context("connect to Wayland compositor")?;
@@ -373,6 +398,8 @@ fn run_capture(
         current_edge: None,
         active,
         allowed_edges,
+        screen_width,
+        screen_height,
         events,
     };
 
@@ -521,6 +548,12 @@ impl CaptureState {
         let height = if max_height > 0 { max_height } else { 1080 };
         (width as f64, height as f64)
     }
+
+    fn publish_screen_dimensions(&self) {
+        let (width, height) = self.estimate_screen_dimensions();
+        self.screen_width.store(width as u32, Ordering::Release);
+        self.screen_height.store(height as u32, Ordering::Release);
+    }
 }
 
 impl CompositorHandler for CaptureState {
@@ -596,6 +629,7 @@ impl LayerShellHandler for CaptureState {
         self.layers[index].width = width;
         self.layers[index].height = height;
         self.layers[index].configured = true;
+        self.publish_screen_dimensions();
         self.draw_layer(layer, width, height);
     }
 }
