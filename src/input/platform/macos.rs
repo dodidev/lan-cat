@@ -133,6 +133,9 @@ struct State {
     events: mpsc::UnboundedSender<CaptureEvent>,
 }
 
+const CORNER_GUARD: f64 = 24.0;
+const DISPLAY_EDGE_INSET: f64 = 1.0;
+
 pub struct Capture {
     pub events: mpsc::UnboundedReceiver<CaptureEvent>,
     state: Arc<Mutex<State>>,
@@ -415,12 +418,17 @@ impl Injector {
         match input {
             PointerInput::Motion { dx, dy } => {
                 let bounds = display_bounds();
-                // Allow cursor to move very close to edges (within 0.5 pixels) to enable exit detection
-                // while still preventing it from going completely off-screen
-                self.point.x = (self.point.x + dx)
-                    .clamp(bounds.origin.x - 0.5, bounds.origin.x + bounds.size.width + 0.5);
-                self.point.y = (self.point.y + dy)
-                    .clamp(bounds.origin.y - 0.5, bounds.origin.y + bounds.size.height + 0.5);
+                // Keep synthetic events inside display bounds. Posting points
+                // outside both axes near a corner makes WindowServer clamp and
+                // re-process them, which feels like cursor lag.
+                self.point.x = (self.point.x + dx).clamp(
+                    bounds.origin.x,
+                    bounds.origin.x + bounds.size.width - DISPLAY_EDGE_INSET,
+                );
+                self.point.y = (self.point.y + dy).clamp(
+                    bounds.origin.y,
+                    bounds.origin.y + bounds.size.height - DISPLAY_EDGE_INSET,
+                );
                 let event_type = if self.buttons & 1 != 0 {
                     LEFT_DRAGGED
                 } else if self.buttons & 2 != 0 {
@@ -472,10 +480,15 @@ impl Injector {
         };
         let bounds = display_bounds();
         match edge {
-            Edge::Left => dx < 0.0 && self.point.x <= bounds.origin.x + 0.5,
-            Edge::Right => dx > 0.0 && self.point.x >= bounds.origin.x + bounds.size.width - 0.5,
-            Edge::Top => dy < 0.0 && self.point.y <= bounds.origin.y + 0.5,
-            Edge::Bottom => dy > 0.0 && self.point.y >= bounds.origin.y + bounds.size.height - 0.5,
+            Edge::Left => dx < 0.0 && self.point.x <= bounds.origin.x + DISPLAY_EDGE_INSET,
+            Edge::Right => {
+                dx > 0.0 && self.point.x >= bounds.origin.x + bounds.size.width - DISPLAY_EDGE_INSET
+            }
+            Edge::Top => dy < 0.0 && self.point.y <= bounds.origin.y + DISPLAY_EDGE_INSET,
+            Edge::Bottom => {
+                dy > 0.0
+                    && self.point.y >= bounds.origin.y + bounds.size.height - DISPLAY_EDGE_INSET
+            }
         }
     }
 
@@ -499,15 +512,23 @@ impl Drop for Injector {
 
 fn crossed_edge(point: CGPoint, dx: f64, dy: f64) -> Option<(Edge, f64)> {
     let bounds = display_bounds();
-    let x = (point.x - bounds.origin.x) / bounds.size.width;
-    let y = (point.y - bounds.origin.y) / bounds.size.height;
-    if dx < 0.0 && x <= 0.001 {
+    let local_x = point.x - bounds.origin.x;
+    let local_y = point.y - bounds.origin.y;
+    let x = local_x / bounds.size.width;
+    let y = local_y / bounds.size.height;
+    let horizontal_guard = CORNER_GUARD.min(bounds.size.width / 4.0);
+    let vertical_guard = CORNER_GUARD.min(bounds.size.height / 4.0);
+    let away_from_horizontal_corners =
+        local_y >= vertical_guard && local_y <= bounds.size.height - vertical_guard;
+    let away_from_vertical_corners =
+        local_x >= horizontal_guard && local_x <= bounds.size.width - horizontal_guard;
+    if dx < 0.0 && x <= 0.001 && away_from_horizontal_corners {
         Some((Edge::Left, y.clamp(0.0, 1.0)))
-    } else if dx > 0.0 && x >= 0.999 {
+    } else if dx > 0.0 && x >= 0.999 && away_from_horizontal_corners {
         Some((Edge::Right, y.clamp(0.0, 1.0)))
-    } else if dy < 0.0 && y <= 0.001 {
+    } else if dy < 0.0 && y <= 0.001 && away_from_vertical_corners {
         Some((Edge::Top, x.clamp(0.0, 1.0)))
-    } else if dy > 0.0 && y >= 0.999 {
+    } else if dy > 0.0 && y >= 0.999 && away_from_vertical_corners {
         Some((Edge::Bottom, x.clamp(0.0, 1.0)))
     } else {
         None

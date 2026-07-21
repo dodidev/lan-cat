@@ -62,7 +62,10 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 use super::{ALL_EDGE_MASK, CaptureEvent, edge_mask};
 use crate::input::protocol::{Edge, KeyboardInput, PointerInput};
 
-const EDGE_THICKNESS: u32 = 8;
+const SIDE_EDGE_THICKNESS: u32 = 8;
+// Keep horizontal overlays out of clickable panels such as Waybar. A thicker
+// overlay receives pointer focus instead of the panel and consumes its clicks.
+const HORIZONTAL_EDGE_THICKNESS: u32 = 1;
 const IDLE_LOCK_TIMEOUT: Duration = Duration::from_millis(750);
 const POOL_BYTES: usize = 512 * 1024;
 const EV_KEY: u16 = 0x01;
@@ -350,23 +353,23 @@ fn run_capture(
         let (anchor, width, height) = match edge {
             Edge::Left => (
                 Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM,
-                EDGE_THICKNESS,
+                SIDE_EDGE_THICKNESS,
                 0,
             ),
             Edge::Right => (
                 Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM,
-                EDGE_THICKNESS,
+                SIDE_EDGE_THICKNESS,
                 0,
             ),
             Edge::Top => (
                 Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
                 0,
-                EDGE_THICKNESS,
+                HORIZONTAL_EDGE_THICKNESS,
             ),
             Edge::Bottom => (
                 Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
                 0,
-                EDGE_THICKNESS,
+                HORIZONTAL_EDGE_THICKNESS,
             ),
         };
         layer.set_anchor(anchor);
@@ -714,8 +717,13 @@ impl LayerShellHandler for CaptureState {
         };
         let edge = self.layers[index].edge;
         let (width, height) = match edge {
-            Edge::Left | Edge::Right => (EDGE_THICKNESS, configure.new_size.1.max(1)),
-            Edge::Top | Edge::Bottom => (configure.new_size.0.max(1), EDGE_THICKNESS),
+            Edge::Left | Edge::Right => {
+                (SIDE_EDGE_THICKNESS, configure.new_size.1.max(1))
+            }
+            Edge::Top | Edge::Bottom => (
+                configure.new_size.0.max(1),
+                HORIZONTAL_EDGE_THICKNESS,
+            ),
         };
         self.layers[index].width = width;
         self.layers[index].height = height;

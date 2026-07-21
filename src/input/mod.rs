@@ -90,6 +90,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
     let mut incoming: Option<Incoming> = None;
     let mut preview: Option<Preview> = None;
     let mut takeover: Option<(String, Instant, Instant)> = None;
+    let mut confirmed_peers = HashSet::new();
     let mut portal_edges: HashMap<String, HashSet<Edge>> = HashMap::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -132,7 +133,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             capture.release();
                             continue;
                         };
-                        if portal_edge_confirmed(&portal_edges, &peer, edge) {
+                        if direct_entry_available(&confirmed_peers, &portal_edges, &peer, edge) {
                             send(
                                 &outbound,
                                 peer.clone(),
@@ -241,7 +242,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 continue;
                             }
                             // Confirmed peers may enter directly; do not replay the portal UI.
-                            if portal_edge_confirmed(&portal_edges, &peer, edge) {
+                            if direct_entry_available(&confirmed_peers, &portal_edges, &peer, edge) {
                                 send(&outbound, peer, InputMessage::ProbeAck)?;
                                 continue;
                             }
@@ -288,7 +289,12 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 && value.last_probe.elapsed() <= PRESS_GAP
                         });
                         let outgoing_wins = outgoing.is_some() && local_id > peer;
-                        let confirmed_portal = portal_edge_confirmed(&portal_edges, &peer, edge);
+                        let confirmed_portal = direct_entry_available(
+                            &confirmed_peers,
+                            &portal_edges,
+                            &peer,
+                            edge,
+                        );
                         let edge_available = portal_edge_available(&portal_edges, &peer, edge);
                         if !edge_available
                             || (!preview_matches && !confirmed_portal)
@@ -316,6 +322,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         capture.set_allowed_edge(Some(edge));
                         injector.begin(edge, position)?;
                         portal_edges.entry(peer.clone()).or_default().insert(edge);
+                        confirmed_peers.insert(peer.clone());
                         incoming = Some(Incoming {
                             peer: peer.clone(),
                             edge,
@@ -338,6 +345,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                                 *ready = true;
                                 tracing::debug!(%peer, source_edge = %edge, "cursor entry acknowledged");
                                 portal_edges.entry(peer.clone()).or_default().insert(*edge);
+                                confirmed_peers.insert(peer);
                             }
                         }
                     }
@@ -355,6 +363,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                             outgoing = None;
                             if let Some(edge) = rejected_direct_edge {
                                 forget_portal_edge(&mut portal_edges, &peer, edge);
+                                confirmed_peers.remove(&peer);
                             }
                             capture.release();
                         }
@@ -437,6 +446,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                     capture.allow_all_edges();
                 }
                 portal_edges.retain(|peer, _| trusted_peers.contains(peer));
+                confirmed_peers.retain(|peer| trusted_peers.contains(peer));
                 if last_ping.elapsed() >= Duration::from_millis(500) {
                     for peer in &trusted_peers {
                         send(&outbound, peer.clone(), InputMessage::Ping)?;
@@ -498,6 +508,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                         let peer = peer.to_owned();
                         outgoing = None;
                         portal_edges.remove(&peer);
+                        confirmed_peers.remove(&peer);
                         capture.release();
                         takeover = Some((peer.clone(), Instant::now(), Instant::now()));
                         send_force_leave(&outbound, peer)?;
@@ -506,6 +517,7 @@ async fn run(cfg: Arc<RwLock<Config>>, local_id: String) -> Result<()> {
                 if incoming.as_ref().is_some_and(|value| peer_timed_out(&last_seen, &value.peer)) {
                     if let Some(active) = incoming.take() {
                         portal_edges.remove(&active.peer);
+                        confirmed_peers.remove(&active.peer);
                         takeover = Some((active.peer.clone(), Instant::now(), Instant::now()));
                         send_force_leave(&outbound, active.peer)?;
                     }
@@ -584,6 +596,15 @@ fn portal_edge_confirmed(
     portal_edges
         .get(peer)
         .is_some_and(|edges| edges.contains(&edge))
+}
+
+fn direct_entry_available(
+    confirmed_peers: &HashSet<String>,
+    portal_edges: &HashMap<String, HashSet<Edge>>,
+    peer: &str,
+    edge: Edge,
+) -> bool {
+    confirmed_peers.contains(peer) && portal_edge_available(portal_edges, peer, edge)
 }
 
 fn forget_portal_edge(portal_edges: &mut HashMap<String, HashSet<Edge>>, peer: &str, edge: Edge) {
@@ -817,6 +838,36 @@ mod tests {
 
         forget_portal_edge(&mut portal_edges, "peer", Edge::Top);
         assert!(!portal_edges.contains_key("peer"));
+    }
+
+    #[test]
+    fn one_handshake_confirms_every_available_edge_for_same_device() {
+        let confirmed_peers = HashSet::from(["peer".to_owned()]);
+        let portal_edges = HashMap::from([
+            ("peer".to_owned(), HashSet::from([Edge::Left])),
+            ("other".to_owned(), HashSet::from([Edge::Bottom])),
+        ]);
+
+        for edge in [Edge::Left, Edge::Right, Edge::Top] {
+            assert!(direct_entry_available(
+                &confirmed_peers,
+                &portal_edges,
+                "peer",
+                edge
+            ));
+        }
+        assert!(!direct_entry_available(
+            &confirmed_peers,
+            &portal_edges,
+            "peer",
+            Edge::Bottom
+        ));
+        assert!(!direct_entry_available(
+            &HashSet::new(),
+            &portal_edges,
+            "peer",
+            Edge::Top
+        ));
     }
 
     #[test]
